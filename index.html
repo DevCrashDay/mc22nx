@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mc22nx — Midnight Club II for Switch</title>
+<style>
+:root { --bg: #f6f7f9; --card: #fff; --text: #1b1f24; --muted: #5b6573; --line: #d9dee5; --accent: #1f6feb; --ok: #1a7f37; --bad: #cf222e; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0d1117; --card: #161b22; --text: #e6edf3; --muted: #9aa5b1; --line: #30363d; --accent: #4493f8; --ok: #3fb950; --bad: #f85149; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 16px 48px; }
+h1 { font-size: 1.6rem; margin: 0 0 4px; }
+.sub { color: var(--muted); margin: 0 0 24px; }
+#drop { background: var(--card); border: 2px dashed var(--line); border-radius: 12px; padding: 40px 16px; text-align: center; cursor: pointer; transition: border-color .15s; }
+#drop.over { border-color: var(--accent); }
+#drop strong { display: block; font-size: 1.15rem; margin-bottom: 6px; }
+#drop span { color: var(--muted); font-size: .95rem; }
+#status { margin: 20px 0 0; min-height: 1.5em; }
+#status.ok { color: var(--ok); } #status.bad { color: var(--bad); }
+progress { width: 100%; height: 8px; margin-top: 10px; display: none; }
+#get { display: none; margin-top: 16px; padding: 12px 20px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font-size: 1rem; cursor: pointer; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; margin-top: 24px; }
+section h2 { font-size: 1.05rem; margin: 0 0 8px; }
+ol, ul { margin: 0; padding-left: 20px; }
+li { margin: 4px 0; }
+code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: .9em; }
+.small { color: var(--muted); font-size: .9rem; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Midnight Club II for Nintendo Switch</h1>
+  <p class="sub">Drop your own copy of the game (USA, SLUS-20209) to get the Switch homebrew files. Everything happens in this browser tab: the ISO is never uploaded.</p>
+
+  <div id="drop" tabindex="0" role="button" aria-label="Choose the game's ISO file">
+    <strong>Drop the .iso here</strong>
+    <span>or click to choose it</span>
+  </div>
+  <input id="file" type="file" accept=".iso" hidden>
+  <div id="status" role="status"></div>
+  <progress id="bar" max="1" value="0"></progress>
+  <button id="get">Download mc22nx.zip</button>
+
+  <section>
+    <h2>Put it on the Switch</h2>
+    <ol>
+      <li>Unpack <code>mc22nx.zip</code> to the root of the SD card: it holds <code>switch/mc22nx.nro</code> and the folder <code>mc2/</code>.</li>
+      <li>Copy your ISO into that folder as <code>sdmc:/mc2/mc2.iso</code> (3.2 GB; FAT32 is fine, the file is under 4 GB).</li>
+      <li>Start the homebrew menu through a game (hold <b>R</b> while starting any game) so the port gets the full memory, and run <b>mc22nx</b>.</li>
+    </ol>
+    <p class="small">Saves go to <code>sdmc:/mc2/mc2.ps2</code>. An <code>env.txt</code> / <code>args.txt</code> in <code>mc2/</code> can change settings (see the repository).</p>
+  </section>
+
+  <section>
+    <h2>How this works</h2>
+    <ul class="small">
+      <li>The page reads only the game's main program (<code>SLUS_202.09</code>) from the ISO and checks that it is the expected version.</li>
+      <li>The Switch build ships encrypted; the key is derived from that file, so it opens only with the game itself.</li>
+      <li>Source code, findings and how to build it yourself: <a href="https://github.com/DevCrashDay/mc22nx">github.com/DevCrashDay/mc22nx</a>.</li>
+    </ul>
+  </section>
+</main>
+<script>
+"use strict";
+const ELF_NAME = "SLUS_202.09;1";
+const ELF_SHA256 = "379670c1135b3db5c1b0e82911a742cafc30cefeefd581259596e00693f0f846";
+const BUNDLE = "mc22nx.bin";
+const SECTOR = 2048;
+
+const $ = (id) => document.getElementById(id);
+const status = (text, kind) => { const s = $("status"); s.textContent = text; s.className = kind || ""; };
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const read = async (file, at, len) => new Uint8Array(await file.slice(at, at + len).arrayBuffer());
+
+// ISO 9660: the primary volume descriptor at sector 16, its root directory, the file in it
+async function findFile(file, name) {
+  const pvd = await read(file, 16 * SECTOR, SECTOR);
+  if (pvd[0] !== 1 || String.fromCharCode(...pvd.subarray(1, 6)) !== "CD001") throw new Error("This is not an ISO 9660 disc image.");
+  const dv = new DataView(pvd.buffer);
+  const rootLba = dv.getUint32(156 + 2, true), rootSize = dv.getUint32(156 + 10, true);
+  const dir = await read(file, rootLba * SECTOR, rootSize);
+  for (let i = 0; i < dir.length;) {
+    const len = dir[i];
+    if (!len) { i = (Math.floor(i / SECTOR) + 1) * SECTOR; continue; }
+    const d = new DataView(dir.buffer, i);
+    const nameLen = dir[i + 32];
+    const n = String.fromCharCode(...dir.subarray(i + 33, i + 33 + nameLen));
+    if (n.toUpperCase() === name) return read(file, d.getUint32(2, true) * SECTOR, d.getUint32(10, true));
+    i += len;
+  }
+  throw new Error("SLUS_202.09 is not on this disc: is it Midnight Club II (USA)?");
+}
+
+async function fetchBundle() {
+  const res = await fetch(BUNDLE);
+  if (!res.ok) throw new Error("Could not load the Switch build (" + res.status + ").");
+  const total = Number(res.headers.get("content-length")) || 0;
+  const reader = res.body.getReader();
+  const parts = [];
+  let got = 0;
+  const bar = $("bar");
+  bar.style.display = "block";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    got += value.length;
+    if (total) bar.value = got / total;
+  }
+  bar.style.display = "none";
+  const out = new Uint8Array(got);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+// ZIP without compression (the files are small next to the ISO, and the .nro is already dense)
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function zip(entries) {
+  const enc = new TextEncoder(), chunks = [], central = [];
+  let offset = 0;
+  for (const { name, data } of entries) {
+    const n = enc.encode(name), crc = crc32(data);
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint32(14, crc, true);
+    h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, n.length, true);
+    chunks.push(new Uint8Array(h.buffer), n, data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint32(16, crc, true);
+    c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, n.length, true); c.setUint32(42, offset, true);
+    central.push(new Uint8Array(c.buffer), n);
+    offset += 30 + n.length + data.length;
+  }
+  const size = central.reduce((s, b) => s + b.length, 0);
+  const e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, entries.length, true); e.setUint16(10, entries.length, true);
+  e.setUint32(12, size, true); e.setUint32(16, offset, true);
+  return new Blob([...chunks, ...central, new Uint8Array(e.buffer)], { type: "application/zip" });
+}
+
+let zipUrl = null;
+async function handle(file) {
+  $("get").style.display = "none";
+  try {
+    status("Reading the game's main program from " + file.name + " …");
+    const elf = await findFile(file, ELF_NAME);
+    if (hex(await crypto.subtle.digest("SHA-256", elf)) !== ELF_SHA256)
+      throw new Error("This disc is a different version: the port needs Midnight Club II USA (SLUS-20209).");
+    status("Game recognized. Loading the Switch build …");
+    const enc = await fetchBundle();
+    status("Unlocking …");
+    const label = new TextEncoder().encode("mc22nx bundle key v1\0");
+    const keyInput = new Uint8Array(label.length + elf.length);
+    keyInput.set(label);
+    keyInput.set(elf, label.length);
+    const keyBytes = await crypto.subtle.digest("SHA-256", keyInput);
+    const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
+    const plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: enc.subarray(0, 12) }, key, enc.subarray(12)));
+    if (String.fromCharCode(...plain.subarray(0, 8)) !== "MC22NX01") throw new Error("The Switch build is damaged.");
+    const hlen = new DataView(plain.buffer).getUint32(8, true);
+    const head = JSON.parse(new TextDecoder().decode(plain.subarray(12, 12 + hlen)));
+    const data = plain.subarray(12 + hlen);
+    const entries = head.files.map((f) => ({ name: f.name, data: data.subarray(f.offset, f.offset + f.size) }));
+    // BOOT.ELF: the game's main program with MC2Recomp's patches applied
+    const boot = new Uint8Array(head.elfPatch.size);
+    boot.set(elf.subarray(0, Math.min(elf.length, boot.length)));
+    for (const [o, from, n] of head.elfPatch.runs) boot.set(data.subarray(from, from + n), o);
+    if (head.elfPatch.tail) { const [o, from, n] = head.elfPatch.tail; boot.set(data.subarray(from, from + n), o); }
+    entries.push({ name: "mc2/BOOT.ELF", data: boot });
+    entries.push({ name: "mc2/PUT_mc2.iso_HERE.txt", data: new TextEncoder().encode("Copy your Midnight Club II ISO into this folder and name it mc2.iso.\r\n") });
+    if (zipUrl) URL.revokeObjectURL(zipUrl);
+    zipUrl = URL.createObjectURL(zip(entries));
+    status("Ready. Download the zip and follow the steps below.", "ok");
+    $("get").style.display = "inline-block";
+  } catch (e) {
+    status(e && e.name === "OperationError" ? "This disc does not unlock the build: is it the USA version?" : String(e.message || e), "bad");
+  }
+}
+
+const drop = $("drop");
+drop.addEventListener("click", () => $("file").click());
+drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") $("file").click(); });
+$("file").addEventListener("change", (e) => e.target.files[0] && handle(e.target.files[0]));
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", (e) => { e.preventDefault(); drop.classList.remove("over"); if (e.dataTransfer.files[0]) handle(e.dataTransfer.files[0]); });
+$("get").addEventListener("click", () => { const a = document.createElement("a"); a.href = zipUrl; a.download = "mc22nx.zip"; a.click(); });
+</script>
+</body>
+</html>
