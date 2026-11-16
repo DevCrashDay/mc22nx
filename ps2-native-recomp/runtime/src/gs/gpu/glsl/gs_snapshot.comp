@@ -1,0 +1,81 @@
+#version 430 core
+// glsl_compat.py: converted for nouveau and Ryujinx (see the script)
+#extension GL_ARB_compute_shader : require
+#extension GL_ARB_shader_storage_buffer_object : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct Params {
+    uvec4 v[16];
+};
+const uint PSMCT32_ = 0u;
+const uint PSMCT24_ = 1u;
+const uint PSMCT16_ = 2u;
+const uint PSMCT16S = 10u;
+const uint PSMT8_ = 19u;
+const uint PSMT4_ = 20u;
+const uint PSMT8H = 27u;
+const uint PSMT4HL = 36u;
+const uint PSMT4HH = 44u;
+const uint PSMZ32_ = 48u;
+const uint PSMZ24_ = 49u;
+const uint PSMZ16_ = 50u;
+const uint PSMZ16S = 58u;
+const uint T_OFF32_ = 0u;
+const uint T_OFFZ32_ = 2048u;
+const uint T_OFF16_ = 4096u;
+const uint T_OFF16S = 8192u;
+const uint T_OFFZ16_ = 12288u;
+const uint T_OFFZ16S = 16384u;
+const uint T_OFF8_ = 20480u;
+const uint T_OFF4_ = 28672u;
+const uint CLUT_ENTRIES = 512u;
+const uint F_IIP = 1u;
+const uint F_TME = 2u;
+const uint F_FGE = 4u;
+const uint F_ABE = 8u;
+const uint F_FST = 16u;
+const uint F_ZMSK = 32u;
+const uint F_ATE = 64u;
+const uint F_DATE = 128u;
+const uint F_DATM = 256u;
+const uint F_ZTE = 512u;
+const uint F_PABE = 1024u;
+const uint F_COLCLAMP = 2048u;
+const uint F_FBA = 4096u;
+const uint F_TCC = 8192u;
+const uint F_BILINEAR = 16384u;
+const uint F_AEM = 32768u;
+const uint F_DTHE = 65536u;
+const uint F_A_FROM_G = 131072u;
+const uint PRIM_WORDS = 28u;
+const uint SETUP_WORDS = 42u;
+const uint MIP_WORDS = 8u;
+const uint SCALE = 1u;
+
+layout(r32ui, binding = 0) uniform coherent uimageBuffer _group_0_binding_0_cs;
+
+layout(std140, binding = 2) uniform Params_block_1Compute { Params _group_0_binding_2_cs; };
+
+layout(r32ui, binding = 5) uniform coherent uimageBuffer _group_0_binding_5_cs;
+
+
+uint prm(uint i) {
+    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
+    return _e9;
+}
+
+void main_body_() {
+    uvec3 gid = gl_GlobalInvocationID;
+    uint i_1 = (gid.x + ((gid.y * 64u) * 1024u));
+    uint _e9 = prm(1u);
+    if ((i_1 >= _e9)) {
+        return;
+    }
+    uint _e15 = prm(0u);
+    uint _e22 = imageLoad(_group_0_binding_0_cs, int((((_e15 * SCALE) * SCALE) + i_1))).x;
+    imageStore(_group_0_binding_5_cs, int(i_1), uvec4(_e22, 0u, 0u, 0u));
+    return;
+}
+
+
+void main() { main_body_(); }

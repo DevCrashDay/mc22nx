@@ -1,0 +1,1647 @@
+struct Params {
+    v: array<vec4<u32>, 16>,
+}
+
+@group(0) @binding(0) var<storage, read_write> vram: array<atomic<u32>>;
+@group(0) @binding(1) var<storage, read> tables: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> data: array<u32>;
+@group(0) @binding(4) var<storage, read_write> clut: array<u32>;
+@group(0) @binding(5) var<storage, read_write> scratch: array<u32>;
+@group(0) @binding(6) var<storage, read> cache: array<u32>;
+@group(0) @binding(7) var<storage, read_write> decoded: array<u32>;
+
+override SCALE: u32 = 1u;
+override TILE: u32 = 16u;
+
+override EXPLICIT_FMA: bool = false;
+// Mipmap levels (docs/mipmap.md). The program that reads them takes about twice as long to translate on FXC (Direct3D 12 without DXC), so
+// the host builds the draw program twice: HAS_MIP = false (plain, the one every draw without mipmap words uses, built at start) and
+// HAS_MIP = true (built in the background, used by the batches that carry a mipmap table). With false every use below folds away.
+override HAS_MIP: bool = false;
+
+// TEX_SS (PS2_TEX_SS=1, off by default: not what the PS2 does), at any resolution: a texture without mip levels that is shrunk more than one texel
+// per sample (a far building's window grid) is sampled at up to 4 x 4 places across the sample's footprint and averaged. One
+// bilinear tap there picks a different window each frame as the view moves (crawling rows of lit windows, moire). The PS2
+// samples it that way too; this is an enhancement, the launcher's Smooth distant textures.
+override TEX_SS: bool = false;
+// DEPTH_FRAC (PS2_DEPTH_FRAC=1, off by default: not what the PS2 does): a 16-bit depth buffer keeps 8 bits of each depth's fraction
+// beside it, and the depth test compares depth and fraction together. The PS2 drops the fraction, so two surfaces drawn on top of
+// each other far away (a mountain's rock and the snow layer on it, under one depth step apart) take turns as the view moves
+// (SR1Recomp: Smuggler's Run's snow level; MC2Recomp: a distant ramp). The fractions live after the emulated memory in the vram
+// buffer (the host makes it twice as large), 16 bits beside each 16-bit depth: the fraction and the low 8 bits of the depth it
+// belongs to, so a depth that something else wrote (an upload, a copy) counts as having no fraction, as on the PS2.
+override DEPTH_FRAC: bool = false;
+var<private> g_zf: f32 = 0.0;  // the fraction of the depth z_at worked out last (0 for shapes drawn at one depth)
+var<private> g_tex_grad: vec4<f32> = vec4<f32>(0.0);  // du/dx, dv/dx, du/dy, dv/dy for one sample step, in level-0 texels
+var<private> g_tex_grad_on: bool = false;
+
+// Where a*b+c is fused into one rounding differs between shader compilers: FXC and the graphics drivers fuse their own way and
+// Microsoft's DXC another, which moved a colour or a texel position by the last bit on a few pixels (docs/speed.md, section DXC).
+// With EXPLICIT_FMA the sums below are written as fma() in the order the other compilers' pictures show (checked by the memory
+// fingerprint of two saved frames), so DXC draws the same picture. Without it the plain expressions stay as they always were.
+fn lerp1(a: f32, b: f32, t: f32) -> f32 {
+    if (EXPLICIT_FMA) {
+        return fma(b - a, t, a);
+    }
+    return a + (b - a) * t;
+}
+
+fn lerp4(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
+    if (EXPLICIT_FMA) {
+        return fma(b - a, vec4<f32>(t), a);
+    }
+    return a + (b - a) * t;
+}
+
+fn bary1(a: f32, b: f32, c: f32, w1: f32, w2: f32) -> f32 {
+    if (EXPLICIT_FMA) {
+        return fma(c - a, w2, fma(b - a, w1, a));
+    }
+    return a + (b - a) * w1 + (c - a) * w2;
+}
+
+fn bary4(a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, w1: f32, w2: f32) -> vec4<f32> {
+    if (EXPLICIT_FMA) {
+        return fma(c - a, vec4<f32>(w2), fma(b - a, vec4<f32>(w1), a));
+    }
+    return a + (b - a) * w1 + (c - a) * w2;
+}
+
+fn weighted4(a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, w0: f32, w1: f32, w2: f32) -> vec4<f32> {
+    if (EXPLICIT_FMA) {
+        return fma(c, vec4<f32>(w2), fma(a, vec4<f32>(w0), b * w1));
+    }
+    return a * w0 + b * w1 + c * w2;
+}
+
+fn weighted2(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
+    if (EXPLICIT_FMA) {
+        return fma(b, vec4<f32>(t), a * (1.0 - t));
+    }
+    return a * (1.0 - t) + b * t;
+}
+
+fn cross2(a: f32, b: f32, c: f32, d: f32) -> f32 {
+    if (EXPLICIT_FMA) {
+        return fma(a, b, -(c * d));
+    }
+    return a * b - c * d;
+}
+
+fn sum2(a: f32, b: f32, w1: f32, w2: f32) -> f32 {
+    if (EXPLICIT_FMA) {
+        return fma(b, w2, a * w1);
+    }
+    return a * w1 + b * w2;
+}
+
+const PSMCT32: u32 = 0x00u;
+const PSMCT24: u32 = 0x01u;
+const PSMCT16: u32 = 0x02u;
+const PSMCT16S: u32 = 0x0Au;
+const PSMT8: u32 = 0x13u;
+const PSMT4: u32 = 0x14u;
+const PSMT8H: u32 = 0x1Bu;
+const PSMT4HL: u32 = 0x24u;
+const PSMT4HH: u32 = 0x2Cu;
+const PSMZ32: u32 = 0x30u;
+const PSMZ24: u32 = 0x31u;
+const PSMZ16: u32 = 0x32u;
+const PSMZ16S: u32 = 0x3Au;
+
+const T_OFF32: u32 = 0u;
+const T_OFFZ32: u32 = 2048u;
+const T_OFF16: u32 = 4096u;
+const T_OFF16S: u32 = 8192u;
+const T_OFFZ16: u32 = 12288u;
+const T_OFFZ16S: u32 = 16384u;
+const T_OFF8: u32 = 20480u;
+const T_OFF4: u32 = 28672u;
+
+const CLUT_ENTRIES: u32 = 512u;
+
+fn prm(i: u32) -> u32 {
+    return params.v[i / 4u][i % 4u];
+}
+
+struct Loc {
+    word: u32,
+    shift: u32,
+    mask: u32,
+}
+
+fn page_addr(bp: u32, bw: u32, x: u32, y: u32, pw: u32, ph: u32) -> u32 {
+    let per_row = max(1u, bw * 64u / pw);
+    return bp * 256u + ((x / pw) + (y / ph) * per_row) * 8192u;
+}
+
+fn locate(psm: u32, bp: u32, bw: u32, x: u32, y: u32) -> Loc {
+    var a = 0u;
+    var shift = 0u;
+    var mask = 0xFFFFFFFFu;
+    switch psm {
+        case 0x30u {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + tables[T_OFFZ32 + (y & 31u) * 64u + (x & 63u)];
+        }
+        case 0x31u {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + tables[T_OFFZ32 + (y & 31u) * 64u + (x & 63u)];
+            mask = 0xFFFFFFu;
+        }
+        case 0x01u {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + tables[T_OFF32 + (y & 31u) * 64u + (x & 63u)];
+            mask = 0xFFFFFFu;
+        }
+        case 0x02u {
+            a = page_addr(bp, bw, x, y, 64u, 64u) + tables[T_OFF16 + (y & 63u) * 64u + (x & 63u)];
+            shift = (a & 2u) * 8u;
+            mask = 0xFFFFu;
+        }
+        case 0x0Au {
+            a = page_addr(bp, bw, x, y, 64u, 64u) + tables[T_OFF16S + (y & 63u) * 64u + (x & 63u)];
+            shift = (a & 2u) * 8u;
+            mask = 0xFFFFu;
+        }
+        case 0x32u {
+            a = page_addr(bp, bw, x, y, 64u, 64u) + tables[T_OFFZ16 + (y & 63u) * 64u + (x & 63u)];
+            shift = (a & 2u) * 8u;
+            mask = 0xFFFFu;
+        }
+        case 0x3Au {
+            a = page_addr(bp, bw, x, y, 64u, 64u) + tables[T_OFFZ16S + (y & 63u) * 64u + (x & 63u)];
+            shift = (a & 2u) * 8u;
+            mask = 0xFFFFu;
+        }
+        case 0x13u {
+            a = page_addr(bp, bw, x, y, 128u, 64u) + tables[T_OFF8 + (y & 63u) * 128u + (x & 127u)];
+            shift = (a & 3u) * 8u;
+            mask = 0xFFu;
+        }
+        case 0x14u {
+            let n = tables[T_OFF4 + (y & 127u) * 128u + (x & 127u)];
+            a = page_addr(bp, bw, x, y, 128u, 128u) + n / 2u;
+            shift = (a & 3u) * 8u + (n & 1u) * 4u;
+            mask = 0xFu;
+        }
+        case 0x1Bu {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + tables[T_OFF32 + (y & 31u) * 64u + (x & 63u)];
+            shift = 24u;
+            mask = 0xFFu;
+        }
+        case 0x24u {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + tables[T_OFF32 + (y & 31u) * 64u + (x & 63u)];
+            shift = 24u;
+            mask = 0xFu;
+        }
+        case 0x2Cu {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + tables[T_OFF32 + (y & 31u) * 64u + (x & 63u)];
+            shift = 28u;
+            mask = 0xFu;
+        }
+        default {
+            a = page_addr(bp, bw, x, y, 64u, 32u) + tables[T_OFF32 + (y & 31u) * 64u + (x & 63u)];
+        }
+    }
+    return Loc((a & 0x3FFFFFu) >> 2u, shift, mask);
+}
+
+struct Fmt {
+    base: u32,
+    per_row: u32,
+    table: u32,
+    bits: u32,
+    mask: u32,
+}
+
+// The three formats of a setup (colour read by the texture, frame, depth) are worked out once per setup by the processor (fmt_words in gpu.cpp)
+// and stored after the setup's 25 fields: worked out here they cost every tile pass the same long switch again.
+fn fmt_at(at: u32) -> Fmt {
+    return Fmt(data[at], data[at + 1u], data[at + 2u], data[at + 3u], data[at + 4u]);
+}
+
+fn addr(f: Fmt, x: u32, y: u32) -> Loc {
+    let pws = f.bits & 15u;
+    let phs = (f.bits >> 4u) & 15u;
+    let amask = (f.bits >> 8u) & 3u;
+    let nbit = (f.bits >> 10u) & 1u;
+    let n = tables[f.table + ((y & ((1u << phs) - 1u)) << pws) + (x & ((1u << pws) - 1u))];
+    let a = f.base + ((x >> pws) + (y >> phs) * f.per_row) * 8192u + (n >> nbit);
+    return Loc((a & 0x3FFFFFu) >> 2u, (f.bits >> 11u) + (a & amask) * 8u + (n & nbit) * 4u, f.mask);
+}
+
+fn load_at(l: Loc, k: u32) -> u32 {
+    return (atomicLoad(&vram[l.word * SCALE * SCALE + k]) >> l.shift) & l.mask;
+}
+
+fn read_sample(psm: u32, bp: u32, bw: u32, x: u32, y: u32, k: u32) -> u32 {
+    let l = locate(psm, bp, bw, x, y);
+    return (atomicLoad(&vram[l.word * SCALE * SCALE + k]) >> l.shift) & l.mask;
+}
+
+fn read_pixel(psm: u32, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
+    return read_sample(psm, bp, bw, x, y, 0u);
+}
+
+// Changes the bits of one pixel that is only part of a word (16-bit and 24-bit formats, 8- and 4-bit uploads) while the threads
+// of its neighbours change theirs: `old` is what the pixel's bits are now (shifted down, as load_at gives them), `value` what they
+// become. One atomic XOR flips exactly the bits that differ, whatever the neighbours do to their own bits in the meantime; the
+// earlier atomic AND followed by an atomic OR cost two read-modify-write trips to memory (lane glow, docs/speed.md). Nothing is
+// written when nothing changes.
+fn store_diff(l: Loc, k: u32, old: u32, value: u32) {
+    let flip = (old ^ value) & l.mask;
+    if (flip != 0u) {
+        atomicXor(&vram[l.word * SCALE * SCALE + k], flip << l.shift);
+    }
+}
+
+fn store(l: Loc, k: u32, value: u32) {
+    let w = l.word * SCALE * SCALE + k;
+    if (l.mask == 0xFFFFFFFFu) {
+        atomicStore(&vram[w], value);
+        return;
+    }
+    store_diff(l, k, (atomicLoad(&vram[w]) >> l.shift) & l.mask, value);
+}
+
+fn write_sample(psm: u32, bp: u32, bw: u32, x: u32, y: u32, k: u32, value: u32) {
+    store(locate(psm, bp, bw, x, y), k, value);
+}
+
+fn write_pixel(psm: u32, bp: u32, bw: u32, x: u32, y: u32, value: u32) {
+    let l = locate(psm, bp, bw, x, y);
+    for (var k = 0u; k < SCALE * SCALE; k = k + 1u) {
+        store(l, k, value);
+    }
+}
+
+fn bits_at(offset: u32, bit: u32, count: u32) -> u32 {
+    let w = offset + bit / 32u;
+    let s = bit % 32u;
+    var v = data[w] >> s;
+    if (s + count > 32u) {
+        v = v | (data[w + 1u] << (32u - s));
+    }
+    if (count == 32u) {
+        return v;
+    }
+    return v & ((1u << count) - 1u);
+}
+
+fn cache_bits_at(offset: u32, bit: u32, count: u32) -> u32 {
+    let w = offset + bit / 32u;
+    let s = bit % 32u;
+    var v = cache[w] >> s;
+    if (s + count > 32u) {
+        v = v | (cache[w + 1u] << (32u - s));
+    }
+    if (count == 32u) {
+        return v;
+    }
+    return v & ((1u << count) - 1u);
+}
+
+
+@compute @workgroup_size(64)
+fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // one thread per sample of a scaled picture (gpu.cpp emit_pre dispatches pixels x SCALE x SCALE): one thread writing the 16
+    // samples of a pixel at 4x in a row made each upload a long chain of memory writes (London at 4x: 270 uploads a frame, 2.8 ms)
+    let g = gid.x + gid.y * 64u * 1024u;
+    let i = g / (SCALE * SCALE);
+    let ks = g % (SCALE * SCALE);
+    if (i >= prm(2u)) {
+        return;
+    }
+    let records = prm(0u);
+    var lo = 0u;
+    var hi = prm(1u);
+    while (hi - lo > 1u) {
+        let mid = (lo + hi) / 2u;
+        if (data[records + mid * 12u + 11u] <= i) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let r = records + lo * 12u;
+    let k = i - data[r + 11u];
+    let rrw = data[r + 5u];
+    let p = data[r + 6u] + k;
+    let x = (data[r + 3u] + p % rrw) & 0x7FFu;
+    let y = (data[r + 4u] + p / rrw) & 0x7FFu;
+    let bpp = data[r + 10u] & 0xFFu;
+    var v = 0u;
+    if ((data[r + 10u] & 0x80000000u) != 0u) {
+        v = cache_bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+    } else {
+        v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+    }
+    let psm = data[r + 2u];
+    // A depth buffer that is put back as it was read (Digital Devil Saga reads its depth and writes it back in every frame)
+    // keeps its finer samples: a read gives the first sample of each pixel, and a write of that same value would otherwise
+    // replace the finer depth of a scaled picture with one value per pixel, and the shapes drawn against it afterwards (lights
+    // a hair in front of a slanted ceiling) would fail in stripes. A changed value is written to every sample as before.
+    // (Depth: one thread does all the samples of the pixel, so that the comparison reads the first sample before it is written.)
+    if (SCALE > 1u && (psm == 0x30u || psm == 0x31u || psm == 0x32u || psm == 0x3Au)) {
+        if (ks != 0u) {
+            return;
+        }
+        let l = locate(psm, data[r], data[r + 1u], x, y);
+        if (((atomicLoad(&vram[l.word * SCALE * SCALE]) >> l.shift) & l.mask) == (v & l.mask)) {
+            return;
+        }
+        write_pixel(psm, data[r], data[r + 1u], x, y, v);
+        return;
+    }
+    store(locate(psm, data[r], data[r + 1u], x, y), ks, v);
+}
+
+@compute @workgroup_size(64)
+fn copy_read(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * 64u * 1024u;
+    let w = prm(5u);
+    let n = SCALE * SCALE;
+    if (i >= w * prm(6u) * n) {
+        return;
+    }
+    let pixel = i / n;
+    let x = (prm(3u) + pixel % w) & 0x7FFu;
+    let y = (prm(4u) + pixel / w) & 0x7FFu;
+    scratch[i] = read_sample(prm(2u), prm(0u), prm(1u), x, y, i % n);
+}
+
+@compute @workgroup_size(64)
+fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * 64u * 1024u;
+    let w = prm(5u);
+    let h = prm(6u);
+    let n = SCALE * SCALE;
+    if (i >= w * h * n) {
+        return;
+    }
+    let dir = prm(7u);
+    let k = i % n;
+    let x = (i / n) % w;
+    let y = (i / n) / w;
+    var sx = x;
+    var sy = y;
+    if ((dir & 1u) != 0u) {
+        sx = w - 1u - x;
+    }
+    if ((dir & 2u) != 0u) {
+        sy = h - 1u - y;
+    }
+    write_sample(prm(2u), prm(0u), prm(1u), (prm(3u) + x) & 0x7FFu, (prm(4u) + y) & 0x7FFu, k, scratch[(sy * w + sx) * n + k]);
+}
+
+@compute @workgroup_size(256)
+fn load_clut(@builtin(local_invocation_index) k: u32) {
+    let count = prm(1u);
+    for (var n = 0u; n < count; n = n + 1u) {
+        let r = prm(0u) + n * 12u;
+        let src = data[r] * CLUT_ENTRIES;
+        let dst = data[r + 1u] * CLUT_ENTRIES;
+        clut[dst + k] = clut[src + k];
+        clut[dst + k + 256u] = clut[src + k + 256u];
+        storageBarrier();
+        let cbp = data[r + 2u];
+        let cpsm = data[r + 3u];
+        let csm = data[r + 4u];
+        let csa = data[r + 5u];
+        let eight = data[r + 6u] != 0u;
+        var entries = 16u;
+        if (eight) {
+            entries = 256u;
+        }
+        if (k < entries) {
+            if (csm != 0u) {
+                clut[dst + ((csa * 16u + k) & 511u)] = read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
+            } else {
+                var x = k & 7u;
+                var y = k >> 3u;
+                var slot = ((csa & 15u) * 16u + k) & 255u;
+                if (eight) {
+                    let j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
+                    x = j & 15u;
+                    y = j >> 4u;
+                    slot = k;
+                }
+                clut[dst + slot] = read_pixel(cpsm, cbp, 1u, x, y);
+            }
+        }
+        storageBarrier();
+    }
+}
+
+@compute @workgroup_size(8, 8)
+fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = prm(5u) * SCALE;
+    let h = prm(6u) * SCALE;
+    if (gid.x >= w || gid.y >= h) {
+        return;
+    }
+    let psm = prm(2u);
+    var sy = gid.y;
+    if (prm(7u) != 0u) {
+        sy = gid.y / 2u;
+    }
+    var c = read_sample(psm, prm(0u), prm(1u), prm(3u) + gid.x / SCALE, prm(4u) + sy / SCALE, (sy % SCALE) * SCALE + gid.x % SCALE);
+    if (psm == PSMCT16 || psm == PSMCT16S) {
+        c = ((c & 0x1Fu) << 3u) | ((c & 0x3E0u) << 6u) | ((c & 0x7C00u) << 9u);
+    }
+    c = c | 0xFF000000u;
+    // The second read circuit (prm 9..18): its rectangle goes over the picture of the main one (PMODE ALP is 0xFF, all of it shows).
+    if (prm(9u) != 0u) {
+        let lx = i32(gid.x) - bitcast<i32>(prm(15u)) * i32(SCALE);
+        let ly = i32(gid.y) - bitcast<i32>(prm(16u)) * i32(SCALE);
+        if (lx >= 0 && ly >= 0 && u32(lx) < prm(17u) * SCALE && u32(ly) < prm(18u) * SCALE) {
+            var oy = u32(ly);
+            if (prm(7u) != 0u) {
+                oy = oy / 2u;
+            }
+            let opsm = prm(12u);
+            var o = read_sample(opsm, prm(10u), prm(11u), prm(13u) + u32(lx) / SCALE, prm(14u) + oy / SCALE, (oy % SCALE) * SCALE + u32(lx) % SCALE);
+            if (opsm == PSMCT16 || opsm == PSMCT16S) {
+                o = ((o & 0x1Fu) << 3u) | ((o & 0x3E0u) << 6u) | ((o & 0x7C00u) << 9u);
+            }
+            c = o | 0xFF000000u;
+        }
+    }
+    scratch[prm(8u) + gid.y * w + gid.x] = c;
+}
+
+struct Setup {
+    flags: u32,
+    fbp: u32,
+    fbw: u32,
+    fpsm: u32,
+    fbmsk: u32,
+    zbp: u32,
+    zpsm: u32,
+    modes: u32,
+    aref: u32,
+    fix: u32,
+    scax0: i32,
+    scax1: i32,
+    scay0: i32,
+    scay1: i32,
+    tbp: u32,
+    tbw: u32,
+    tpsm: u32,
+    tw: u32,
+    th: u32,
+    cpsm: u32,
+    csa: u32,
+    minu: u32,
+    maxu: u32,
+    minv: u32,
+    maxv: u32,
+    ta0: u32,
+    ta1: u32,
+    fogcol: u32,
+    clut: u32,
+    zmax: u32,
+    dec: u32,
+    tf: Fmt,
+    ff: Fmt,
+    zf: Fmt,
+    // Mipmapping (make_mip in gpu.cpp, docs/mipmap.md): 0 when the texture is sampled as before, else TEX1's fields; `mip_at` is where the
+    // setup's table entry starts (word 0 is `mip`, words 1 to 6 the base pointer and buffer width of levels 1 to 6).
+    mip: u32,
+    mip_at: u32,
+    // DIMX, the dither matrix (setup words 40 and 41, gpu.cpp make_setup; PS2_DITHER=1)
+    dimx0: u32,
+    dimx1: u32,
+}
+
+const F_IIP: u32 = 1u;
+const F_TME: u32 = 2u;
+const F_FGE: u32 = 4u;
+const F_ABE: u32 = 8u;
+const F_FST: u32 = 16u;
+const F_ZMSK: u32 = 32u;
+const F_ATE: u32 = 64u;
+const F_DATE: u32 = 128u;
+const F_DATM: u32 = 256u;
+const F_ZTE: u32 = 512u;
+const F_PABE: u32 = 1024u;
+const F_COLCLAMP: u32 = 2048u;
+const F_FBA: u32 = 4096u;
+const F_TCC: u32 = 8192u;
+const F_BILINEAR: u32 = 16384u;
+const F_AEM: u32 = 32768u;
+const F_DTHE: u32 = 65536u;
+const F_A_FROM_G: u32 = 131072u;  // the texel's alpha is its green (gpu.cpp g_alpha_from_green; Midnight Club II's headlight light)
+
+fn load_setup(at: u32) -> Setup {
+    var s: Setup;
+    s.flags = data[at];
+    s.fbp = data[at + 1u];
+    s.fbw = data[at + 2u];
+    s.fpsm = data[at + 3u];
+    s.fbmsk = data[at + 4u];
+    s.zbp = data[at + 5u];
+    s.zpsm = data[at + 6u];
+    s.modes = data[at + 7u];
+    s.aref = data[at + 8u];
+    s.fix = data[at + 9u];
+    s.scax0 = i32(data[at + 10u] & 0xFFFFu);
+    s.scax1 = i32(data[at + 10u] >> 16u);
+    s.scay0 = i32(data[at + 11u] & 0xFFFFu);
+    s.scay1 = i32(data[at + 11u] >> 16u);
+    s.tbp = data[at + 12u];
+    s.tbw = data[at + 13u];
+    s.tpsm = data[at + 14u];
+    s.tw = data[at + 15u] & 0xFFu;
+    s.th = data[at + 15u] >> 8u;
+    s.cpsm = data[at + 16u];
+    s.csa = data[at + 17u];
+    s.minu = data[at + 18u] & 0xFFFFu;
+    s.maxu = data[at + 18u] >> 16u;
+    s.minv = data[at + 19u] & 0xFFFFu;
+    s.maxv = data[at + 19u] >> 16u;
+    s.ta0 = data[at + 20u] & 0xFFu;
+    s.ta1 = (data[at + 20u] >> 8u) & 0xFFu;
+    s.fogcol = data[at + 21u];
+    s.clut = data[at + 22u];
+    s.zmax = data[at + 23u];
+    s.dec = data[at + 24u];
+    s.tf = fmt_at(at + 25u);
+    s.ff = fmt_at(at + 30u);
+    s.zf = fmt_at(at + 35u);
+    s.mip = 0u;
+    s.mip_at = 0u;
+    s.dimx0 = data[at + 40u];
+    s.dimx1 = data[at + 41u];
+    return s;
+}
+
+fn has(s: Setup, f: u32) -> bool {
+    return (s.flags & f) != 0u;
+}
+
+fn mode(s: Setup, shift: u32, bits: u32) -> u32 {
+    return (s.modes >> shift) & ((1u << bits) - 1u);
+}
+
+fn clamp255(v: i32) -> i32 {
+    return clamp(v, 0, 255);
+}
+
+fn expand16(c: u32, s: Setup) -> u32 {
+    let r = (c & 0x1Fu) << 3u;
+    let g = ((c >> 5u) & 0x1Fu) << 3u;
+    let b = ((c >> 10u) & 0x1Fu) << 3u;
+    var a = s.ta0;
+    if ((c & 0x8000u) != 0u) {
+        a = s.ta1;
+    } else if (has(s, F_AEM) && (c & 0x7FFFu) == 0u) {
+        a = 0u;
+    }
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
+fn wrap_coord(v: i32, size: i32, m: u32, mn: u32, mx: u32) -> i32 {
+    switch m {
+        case 0u {
+            return v & (size - 1);
+        }
+        case 1u {
+            return clamp(v, 0, size - 1);
+        }
+        case 2u {
+            return clamp(v, i32(mn), i32(mx));
+        }
+        default {
+            return i32((u32(v) & mn) | mx);
+        }
+    }
+}
+
+fn texel_x(s: Setup, xi: i32) -> u32 {
+    return u32(wrap_coord(xi, 1 << s.tw, mode(s, 24u, 2u), s.minu, s.maxu));
+}
+
+fn texel_y(s: Setup, yi: i32) -> u32 {
+    return u32(wrap_coord(yi, 1 << s.th, mode(s, 26u, 2u), s.minv, s.maxv));
+}
+
+var<private> snapshot_lo: u32 = 0u;
+var<private> snapshot_hi: u32 = 0u;
+// A sprite that copies a rendered picture (a colour or depth format) at almost 1:1 but not exactly, with a slight zoom or a
+// fractional offset, reads it on the inner-resolution grid (rt_copy, set per pixel in shade_at): texel X / SCALE and sub-sample
+// X % SCALE on each axis. Read on the console's grid with the output pixel's own sub-sample, such a copy lands up to one console
+// pixel off at SCALE > 1, and the picture blended over the frame draws a blocky fringe around everything with contrast. Digital
+// Devil Saga blends the last frame, 0.2 % larger and half a pixel off, over each new one (an afterimage glow); exact 1:1 copies
+// are unchanged.
+var<private> rt_copy: bool = false;
+
+fn load_texel(l: Loc, k: u32) -> u32 {
+    if (l.word >= snapshot_lo && l.word < snapshot_hi) {
+        return (scratch[(l.word - snapshot_lo) * SCALE * SCALE + k] >> l.shift) & l.mask;
+    }
+    return load_at(l, k);
+}
+
+fn fetch_sub(s: Setup, xs: i32, ys: i32) -> u32 {
+    let n = i32(SCALE);
+    let tx = select(xs / n, (xs - n + 1) / n, xs < 0);
+    let ty = select(ys / n, (ys - n + 1) / n, ys < 0);
+    return fetch(s, tx, ty, u32(ys - ty * n) * SCALE + u32(xs - tx * n));
+}
+
+fn unpack4(c: u32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(c & 0xFFu, (c >> 8u) & 0xFFu, (c >> 16u) & 0xFFu, c >> 24u));
+}
+
+// A bilinear read on the inner-resolution grid (u, v in inner texels, the half-texel shift already taken off).
+fn bilinear_sub(s: Setup, u: f32, v: f32) -> vec4<f32> {
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    let fx = u - f32(x0);
+    let fy = v - f32(y0);
+    let top = lerp4(unpack4(fetch_sub(s, x0, y0)), unpack4(fetch_sub(s, x0 + 1, y0)), fx);
+    let bottom = lerp4(unpack4(fetch_sub(s, x0, y0 + 1)), unpack4(fetch_sub(s, x0 + 1, y0 + 1)), fx);
+    return lerp4(top, bottom, fy);
+}
+
+// The console's bilinear filter spreads over one console texel each way (a tent of half-width 1); on the inner grid that tent is
+// exactly the sum of inner-grid bilinear reads at offsets m = -(SCALE-1)..SCALE-1 inner texels, weighted (SCALE - |m|) per axis
+// (the tent is linear between multiples of 1/SCALE). So the copy keeps the inner resolution and the blur the game asked for: a
+// narrower blur showed the previous frame's fine stripes crisp next to the current ones (flickering lines on striped lights).
+fn sample_scaled(s: Setup, uin: f32, vin: f32) -> u32 {
+    let nf = f32(SCALE);
+    if (!has(s, F_BILINEAR)) {
+        return fetch_sub(s, i32(floor(uin * nf)), i32(floor(vin * nf)));
+    }
+    let u = uin * nf - 0.5;
+    let v = vin * nf - 0.5;
+    let n = i32(SCALE);
+    var acc = vec4<f32>(0.0);
+    for (var my = 1 - n; my < n; my = my + 1) {
+        for (var mx = 1 - n; mx < n; mx = mx + 1) {
+            let w = f32((n - abs(mx)) * (n - abs(my)));
+            acc = acc + w * bilinear_sub(s, u + f32(mx), v + f32(my));
+        }
+    }
+    let o = vec4<u32>(clamp(acc / f32(n * n * n * n) + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+    return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
+}
+
+fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
+    return fetch_at(s, texel_x(s, xi), texel_y(s, yi), k);
+}
+
+fn fetch_at(s: Setup, x: u32, y: u32, k: u32) -> u32 {
+    if (s.dec != 0xFFFFFFFFu) {
+        return decoded[s.dec + (y << s.tw) + x];
+    }
+    return convert(s, load_texel(addr(s.tf, x, y), k));
+}
+
+fn convert(s: Setup, raw: u32) -> u32 {
+    switch s.tpsm {
+        case 0x00u, 0x30u {
+            return raw;
+        }
+        case 0x01u, 0x31u {
+            var a = s.ta0;
+            if (has(s, F_AEM) && (raw & 0xFFFFFFu) == 0u) {
+                a = 0u;
+            }
+            return (raw & 0xFFFFFFu) | (a << 24u);
+        }
+        case 0x02u, 0x0Au, 0x32u, 0x3Au {
+            return expand16(raw, s);
+        }
+        case 0x13u, 0x1Bu {
+            let e = clut[s.clut * CLUT_ENTRIES + (raw & 255u)];
+            if (s.cpsm == PSMCT32 || s.cpsm == PSMCT24) {
+                return e;
+            }
+            return expand16(e, s);
+        }
+        case 0x14u, 0x24u, 0x2Cu {
+            let e = clut[s.clut * CLUT_ENTRIES + (((s.csa & 15u) * 16u + (raw & 15u)) & 511u)];
+            if (s.cpsm == PSMCT32 || s.cpsm == PSMCT24) {
+                return e;
+            }
+            return expand16(e, s);
+        }
+        default {
+            return raw;
+        }
+    }
+}
+
+fn spread_x(x: u32) -> u32 {
+    return (x & 1u) | ((x & 6u) << 1u) | ((x & 8u) << 3u) | ((x & 16u) << 4u) | ((x & 32u) << 5u);
+}
+
+fn spread_y(y: u32) -> u32 {
+    return ((y & 1u) << 1u) | ((y & 6u) << 3u) | ((y & 8u) << 4u) | ((y & 16u) << 5u);
+}
+
+fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
+    let word = ((page + (n << 2u)) & 0x3FFFFFu) >> 2u;
+    var raw = 0u;
+    if (word >= snapshot_lo && word < snapshot_hi) {
+        raw = scratch[(word - snapshot_lo) * SCALE * SCALE + k];
+    } else {
+        raw = atomicLoad(&vram[word * SCALE * SCALE + k]);
+    }
+    return convert(s, raw & s.tf.mask);
+}
+
+// Which of a texel's SCALE x SCALE samples a texture read takes (MC1Recomp): the one under the texture position, measured from
+// texel `cell`'s corner (clamped into it for a bilinear neighbour). A texture the game drew itself (Midnight Club's car reflection
+// map, drawn each frame) holds different samples in a texel at SCALE > 1; reading the sample of the screen pixel's own position
+// instead (the old `k`) gave every textured pixel a SCALE-pixel cycle through them, a fine screen-door grid over the cars. A texture
+// sent from the EE has the same value in all of a texel's samples, so it reads exactly as before, and a copy laid on the screen
+// one to one still reads its own samples (the texture position moves with the screen position).
+fn sub_of(t: f32, cell: i32) -> u32 {
+    return u32(clamp(i32(floor((t - f32(cell)) * f32(SCALE))), 0, i32(SCALE) - 1));
+}
+
+// Only textures in a colour format the GS can draw into (32, 24 and 16 bit, read directly) take the sample under the texture
+// position; palette textures (indices sent from the EE) keep the screen sample, as before.
+var<private> g_sub_by_tex: bool = false;
+fn drawn_format(s: Setup) -> bool {
+    return g_sub_by_tex && s.dec == 0xFFFFFFFFu && (s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au);
+}
+
+fn sample(s: Setup, uin: f32, vin: f32, k_screen: u32) -> u32 {
+    if (rt_copy) {
+        return sample_scaled(s, uin, vin);
+    }
+    let drawn = drawn_format(s);
+    if (!has(s, F_BILINEAR)) {
+        let cx = i32(floor(uin));
+        let cy = i32(floor(vin));
+        return fetch(s, cx, cy, select(k_screen, sub_of(vin, cy) * SCALE + sub_of(uin, cx), drawn));
+    }
+    let u = uin - 0.5;
+    let v = vin - 0.5;
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    let xa = texel_x(s, x0);
+    let xb = texel_x(s, x0 + 1);
+    let ya = texel_y(s, y0);
+    let yb = texel_y(s, y0 + 1);
+    // the screen sample (as before) for a palette texture: kya + kxa etc. all come out k_screen
+    let kxa = select(k_screen % SCALE, sub_of(uin, x0), drawn);
+    let kxb = select(k_screen % SCALE, sub_of(uin, x0 + 1), drawn);
+    let kya = select(k_screen - k_screen % SCALE, sub_of(vin, y0) * SCALE, drawn);
+    let kyb = select(k_screen - k_screen % SCALE, sub_of(vin, y0 + 1) * SCALE, drawn);
+    if (s.dec == 0xFFFFFFFFu && s.tpsm <= 1u) {
+        // 32-bit colour: the page position and the position inside the page are separate sums of the x and the y part
+        let pxa = (xa >> 6u) * 8192u + s.tf.base;
+        let pxb = (xb >> 6u) * 8192u + s.tf.base;
+        let pya = (ya >> 5u) * s.tf.per_row * 8192u;
+        let pyb = (yb >> 5u) * s.tf.per_row * 8192u;
+        let nxa = spread_x(xa);
+        let nxb = spread_x(xb);
+        let nya = spread_y(ya);
+        let nyb = spread_y(yb);
+        return blend4(tap32(s, pxa + pya, nxa | nya, kya + kxa), tap32(s, pxb + pya, nxb | nya, kya + kxb), tap32(s, pxa + pyb, nxa | nyb, kyb + kxa), tap32(s, pxb + pyb, nxb | nyb, kyb + kxb), u - f32(x0), v - f32(y0));
+    }
+    return blend4(fetch_at(s, xa, ya, kya + kxa), fetch_at(s, xb, ya, kya + kxb), fetch_at(s, xa, yb, kyb + kxa), fetch_at(s, xb, yb, kyb + kxb), u - f32(x0), v - f32(y0));
+}
+
+// Mip level n of the texture as a setup of its own (raster.cpp, level_setup): its base pointer and buffer width from the table, its size
+// (TW and TH shifted by the level, at least one texel), the region of the clamp modes 2 and 3 shifted the same way, never the decoded copy.
+fn level_setup(s: Setup, n: u32) -> Setup {
+    var l = s;
+    let w = data[s.mip_at + n];
+    let bp = w & 0x3FFFu;
+    let bw = (w >> 14u) & 0x3Fu;
+    l.tbp = bp;
+    l.tbw = bw;
+    l.tf.base = bp * 256u;
+    l.tf.per_row = max(1u, (bw * 64u) >> (s.tf.bits & 15u));
+    l.tw = select(0u, s.tw - n, s.tw > n);
+    l.th = select(0u, s.th - n, s.th > n);
+    l.minu = s.minu >> n;
+    l.maxu = s.maxu >> n;
+    l.minv = s.minv >> n;
+    l.maxv = s.maxv >> n;
+    l.dec = 0xFFFFFFFFu;
+    return l;
+}
+
+fn blend_levels(a: u32, b: u32, f: f32) -> u32 {
+    let x = vec4<f32>(vec4<u32>(a & 0xFFu, (a >> 8u) & 0xFFu, (a >> 16u) & 0xFFu, a >> 24u));
+    let y = vec4<f32>(vec4<u32>(b & 0xFFu, (b >> 8u) & 0xFFu, (b >> 16u) & 0xFFu, b >> 24u));
+    let o = vec4<u32>(clamp(x + (y - x) * f + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+    return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
+}
+
+struct Pick {
+    level: u32,
+    frac: f32,
+    linear: u32,
+}
+
+// The GS's level of detail (GS User's Manual, TEX1; raster.cpp, pick_level): LOD = K with LCM = 1, else (log2(1/|Q|) << L) + K, K a signed
+// 7.4 number. LOD <= 0 magnifies (MMAG, level 0); LOD > 0 reduces (MMIN): *_MIPMAP_NEAREST take the level nearest to LOD, *_MIPMAP_LINEAR
+// blend the two levels around it by its fraction, never past MXL; NEAREST_* / LINEAR_* is the filter inside a level. Only the choice: the
+// sampling stays in one place in plot(), because every copy of sample() makes the program longer to translate (FXC took minutes with six).
+fn mip_pick(s: Setup, q: f32) -> Pick {
+    let lk = f32(bitcast<i32>(((s.mip >> 16u) & 0xFFFu) << 20u) >> 20u) / 16.0;
+    var lod = lk;
+    if ((s.mip & 1u) == 0u) {
+        lod = log2(1.0 / abs(q)) * f32(1u << ((s.mip >> 8u) & 3u)) + lk;
+    }
+    let mxl = (s.mip >> 1u) & 7u;
+    let mmin = (s.mip >> 5u) & 7u;
+    if (!(lod > 0.0)) {
+        return Pick(0u, 0.0, (s.mip >> 4u) & 1u);
+    }
+    if (mmin < 2u) {
+        return Pick(0u, 0.0, mmin & 1u);
+    }
+    let linear = select(0u, 1u, mmin >= 4u);
+    if (mxl == 0u) {
+        return Pick(0u, 0.0, linear);
+    }
+    if ((mmin & 1u) == 0u) {
+        return Pick(u32(min(floor(lod + 0.5), f32(mxl))), 0.0, linear);
+    }
+    let whole = floor(lod);
+    if (whole >= f32(mxl)) {
+        return Pick(mxl, 0.0, linear);
+    }
+    return Pick(u32(whole), lod - whole, linear);
+}
+
+// Smooth distant textures (TEX_SS): up to 4 x 4 reads spread over the sample's footprint (g_tex_grad, shade_at), averaged, for a
+// texture read at its base level without mip levels (`on`); otherwise, or with TEX_SS off, the one read as before.
+fn sample_ss(s: Setup, u: f32, v: f32, k: u32, on: bool) -> u32 {
+    if (!TEX_SS || !on || !g_tex_grad_on || rt_copy) {
+        return sample(s, u, v, k);
+    }
+    let gx = g_tex_grad.xy;
+    let gy = g_tex_grad.zw;
+    // Taps only where the footprint is more than about 1.5 texels across (rounded, not ceil: a footprint of 1.01 texels took 2 x 2
+    // bilinear taps, 16 reads, for no visible change); several taps are single texels, as the average over the footprint is the
+    // filter (a bilinear tap each read 4 texels, up to 64 a pixel: Smooth distant textures cost 9 ms a frame at 4x in Midnight Club).
+    let nx = u32(clamp(floor(length(gx) + 0.5), 1.0, 4.0));
+    let ny = u32(clamp(floor(length(gy) + 0.5), 1.0, 4.0));
+    if (nx * ny == 1u) {
+        return sample(s, u, v, k);
+    }
+    var acc = vec4<f32>(0.0);
+    for (var j = 0u; j < ny; j = j + 1u) {
+        let oy = (f32(j) + 0.5) / f32(ny) - 0.5;
+        for (var i = 0u; i < nx; i = i + 1u) {
+            let ox = (f32(i) + 0.5) / f32(nx) - 0.5;
+            let tu = u + gx.x * ox + gy.x * oy;
+            let tv = v + gx.y * ox + gy.y * oy;
+            let cx = i32(floor(tu));
+            let cy = i32(floor(tv));
+            let c = fetch(s, cx, cy, select(k, sub_of(tv, cy) * SCALE + sub_of(tu, cx), drawn_format(s)));
+            acc = acc + vec4<f32>(vec4<u32>(c & 0xFFu, (c >> 8u) & 0xFFu, (c >> 16u) & 0xFFu, c >> 24u));
+        }
+    }
+    let o = vec4<u32>(clamp(acc / f32(nx * ny) + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+    return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
+}
+
+fn tex_uv(s: Setup, t: vec4<f32>) -> vec2<f32> {
+    if (has(s, F_FST)) {
+        return vec2<f32>(t.x / 16.0, t.y / 16.0);
+    }
+    var q = t.z;
+    if (q == 0.0) {
+        q = 1.0;
+    }
+    return vec2<f32>(t.x / q * f32(1u << s.tw), t.y / q * f32(1u << s.th));
+}
+
+fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
+    let a = vec4<f32>(vec4<u32>(c00 & 0xFFu, (c00 >> 8u) & 0xFFu, (c00 >> 16u) & 0xFFu, c00 >> 24u));
+    let b = vec4<f32>(vec4<u32>(c10 & 0xFFu, (c10 >> 8u) & 0xFFu, (c10 >> 16u) & 0xFFu, c10 >> 24u));
+    let c = vec4<f32>(vec4<u32>(c01 & 0xFFu, (c01 >> 8u) & 0xFFu, (c01 >> 16u) & 0xFFu, c01 >> 24u));
+    let d = vec4<f32>(vec4<u32>(c11 & 0xFFu, (c11 >> 8u) & 0xFFu, (c11 >> 16u) & 0xFFu, c11 >> 24u));
+    let top = lerp4(a, b, fx);
+    let bottom = lerp4(c, d, fx);
+    let o = vec4<u32>(clamp(lerp4(top, bottom, fy) + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+    return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
+}
+
+fn read_frame(s: Setup, l: Loc, k: u32) -> u32 {
+    let raw = load_at(l, k);
+    switch s.fpsm {
+        case 0x01u {
+            return raw | 0x80000000u;
+        }
+        case 0x02u, 0x0Au {
+            var a = 0u;
+            if ((raw & 0x8000u) != 0u) {
+                a = 0x80000000u;
+            }
+            return ((raw & 0x1Fu) << 3u) | (((raw >> 5u) & 0x1Fu) << 11u) | (((raw >> 10u) & 0x1Fu) << 19u) | a;
+        }
+        default {
+            return raw;
+        }
+    }
+}
+
+fn pack16(v: u32) -> u32 {
+    var a = 0u;
+    if ((v & 0x80000000u) != 0u) {
+        a = 0x8000u;
+    }
+    return ((v >> 3u) & 0x1Fu) | (((v >> 11u) & 0x1Fu) << 5u) | (((v >> 19u) & 0x1Fu) << 10u) | a;
+}
+
+fn write_frame(s: Setup, l: Loc, k: u32, c: u32, mask: u32) {
+    switch s.fpsm {
+        case 0x02u, 0x0Au {
+            let old = load_at(l, k);
+            var m16 = pack16(mask);
+            if ((mask & 0x80000000u) != 0u) {
+                m16 = m16 | 0x8000u;
+            }
+            store_diff(l, k, old, (pack16(c) & ~m16) | (old & m16));
+        }
+        case 0x01u {
+            let l32 = Loc(l.word, 0u, 0xFFFFFFFFu);
+            let old = load_at(l32, k);
+            let m = mask | 0xFF000000u;
+            store(l32, k, (c & ~m) | (old & m));
+        }
+        default {
+            if (l.mask != 0xFFFFFFFFu) {
+                let old = load_at(l, k);
+                store_diff(l, k, old, (c & ~mask) | (old & mask));
+                return;
+            }
+            var v = c;
+            if (mask != 0u) {
+                let old = load_at(l, k);
+                v = (c & ~mask) | (old & mask);
+            }
+            store(l, k, v);
+        }
+    }
+}
+
+struct Attr {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+    s: f32,
+    t: f32,
+    q: f32,
+    f: f32,
+    z: u32,
+}
+
+fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
+    if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
+        return;
+    }
+    let scanmsk = mode(s, 28u, 2u);
+    if (scanmsk == 2u && (y & 1) == 0) {
+        return;
+    }
+    if (scanmsk == 3u && (y & 1) != 0) {
+        return;
+    }
+    let ux = u32(x);
+    let uy = u32(y);
+    let z = min(at.z, s.zmax);
+    let fl = addr(s.ff, ux, uy);
+    var zl = Loc(0u, 0u, 0u);
+
+    var dst = 0u;
+    var have_dst = false;
+    if (has(s, F_DATE)) {
+        dst = read_frame(s, fl, k);
+        have_dst = true;
+        if (((dst & 0x80000000u) != 0u) != has(s, F_DATM)) {
+            return;
+        }
+    }
+
+    let zte = has(s, F_ZTE);
+    if (zte) {
+        let ztst = mode(s, 8u, 2u);
+        if (ztst == 0u) {
+            return;
+        }
+        zl = addr(s.zf, ux, uy);
+        if (ztst != 1u) {
+            let old = load_at(zl, k) & s.zmax;
+            if (DEPTH_FRAC && s.zmax == 0xFFFFu) {
+                // depth and fraction together (DEPTH_FRAC): 24 bits, the depth above the 8 fraction bits
+                let a = (z << 8u) | depth_frac(at.z, s.zmax);
+                let b = (old << 8u) | frac_at(zl, k, old);
+                if ((ztst == 2u && a < b) || (ztst == 3u && a <= b)) {
+                    return;
+                }
+            } else if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
+                return;
+            }
+        }
+    }
+
+    var r = i32(at.r);
+    var g = i32(at.g);
+    var b = i32(at.b);
+    var a = i32(at.a);
+    if (has(s, F_TME)) {
+        var u: f32;
+        var v: f32;
+        var q = 1.0;
+        var nu = 0.0;
+        var nv = 0.0;
+        if (has(s, F_FST)) {
+            u = at.s / 16.0;
+            v = at.t / 16.0;
+        } else {
+            q = at.q;
+            if (q == 0.0) {
+                q = 1.0;
+            }
+            nu = at.s / q;
+            nv = at.t / q;
+            u = nu * f32(1u << s.tw);
+            v = nv * f32(1u << s.th);
+        }
+        // One level (two when *_MIPMAP_LINEAR blends): without mipmap words that is level 0 with the setup as it is, as before.
+        var base = s;
+        var p = Pick(0u, 0.0, 0u);
+        if (HAS_MIP && s.mip != 0u) {
+            p = mip_pick(s, q);
+            if (p.linear != 0u) {
+                base.flags = base.flags | F_BILINEAR;
+            } else {
+                base.flags = base.flags & ~F_BILINEAR;
+            }
+        }
+        let levels = select(1u, 2u, p.frac > 0.0);
+        var t = 0u;
+        for (var i = 0u; i < levels; i = i + 1u) {
+            let n = p.level + i;
+            var l = base;
+            var lu = u;
+            var lv = v;
+            if (n != 0u) {
+                l = level_setup(base, n);
+                if (has(s, F_FST)) {
+                    lu = u / f32(1u << n);
+                    lv = v / f32(1u << n);
+                } else {
+                    lu = nu * f32(1u << l.tw);
+                    lv = nv * f32(1u << l.th);
+                }
+            }
+            let c = sample_ss(l, lu, lv, k, levels == 1u && n == 0u && !(HAS_MIP && s.mip != 0u));
+            if (i == 0u) {
+                t = c;
+            } else {
+                t = blend_levels(t, c, p.frac);
+            }
+        }
+        if (has(s, F_A_FROM_G)) {
+            t = (t & 0x00FFFFFFu) | (((t >> 8u) & 0xFFu) << 24u);
+        }
+        let tr = i32(t & 0xFFu);
+        let tg = i32((t >> 8u) & 0xFFu);
+        let tb = i32((t >> 16u) & 0xFFu);
+        let ta = i32(t >> 24u);
+        let tcc = has(s, F_TCC);
+        switch mode(s, 20u, 2u) {
+            case 0u {
+                r = clamp255((tr * r) >> 7u);
+                g = clamp255((tg * g) >> 7u);
+                b = clamp255((tb * b) >> 7u);
+                if (tcc) {
+                    a = clamp255((ta * a) >> 7u);
+                }
+            }
+            case 1u {
+                r = tr;
+                g = tg;
+                b = tb;
+                if (tcc) {
+                    a = ta;
+                }
+            }
+            case 2u {
+                r = clamp255(((tr * r) >> 7u) + a);
+                g = clamp255(((tg * g) >> 7u) + a);
+                b = clamp255(((tb * b) >> 7u) + a);
+                if (tcc) {
+                    a = clamp255(ta + a);
+                }
+            }
+            default {
+                r = clamp255(((tr * r) >> 7u) + a);
+                g = clamp255(((tg * g) >> 7u) + a);
+                b = clamp255(((tb * b) >> 7u) + a);
+                if (tcc) {
+                    a = ta;
+                }
+            }
+        }
+    }
+    if (has(s, F_FGE)) {
+        let f = i32(at.f);
+        let fr = i32(s.fogcol & 0xFFu);
+        let fg = i32((s.fogcol >> 8u) & 0xFFu);
+        let fb = i32((s.fogcol >> 16u) & 0xFFu);
+        r = (f * r + (255 - f) * fr) >> 8u;
+        g = (f * g + (255 - f) * fg) >> 8u;
+        b = (f * b + (255 - f) * fb) >> 8u;
+    }
+
+    var write_fb = true;
+    var write_z = !has(s, F_ZMSK);
+    var write_alpha = true;
+    if (has(s, F_ATE)) {
+        let av = u32(a);
+        var ok = false;
+        switch mode(s, 0u, 3u) {
+            case 0u {
+                ok = false;
+            }
+            case 1u {
+                ok = true;
+            }
+            case 2u {
+                ok = av < s.aref;
+            }
+            case 3u {
+                ok = av <= s.aref;
+            }
+            case 4u {
+                ok = av == s.aref;
+            }
+            case 5u {
+                ok = av >= s.aref;
+            }
+            case 6u {
+                ok = av > s.aref;
+            }
+            default {
+                ok = av != s.aref;
+            }
+        }
+        if (!ok) {
+            switch mode(s, 4u, 2u) {
+                case 0u {
+                    return;
+                }
+                case 1u {
+                    write_z = false;
+                }
+                case 2u {
+                    write_fb = false;
+                }
+                default {
+                    write_z = false;
+                    write_alpha = false;
+                }
+            }
+        }
+    }
+
+    if (write_fb) {
+        let colclamp = has(s, F_COLCLAMP);
+        if (has(s, F_ABE) && (!has(s, F_PABE) || (a & 0x80) != 0)) {
+            if (!have_dst) {
+                dst = read_frame(s, fl, k);
+            }
+            let cd = vec3<i32>(i32(dst & 0xFFu), i32((dst >> 8u) & 0xFFu), i32((dst >> 16u) & 0xFFu));
+            let cs = vec3<i32>(r, g, b);
+            let ad = i32(dst >> 24u);
+            let ba = mode(s, 12u, 2u);
+            let bb = mode(s, 14u, 2u);
+            let bc = mode(s, 16u, 2u);
+            let bd = mode(s, 18u, 2u);
+            var cc = i32(s.fix);
+            if (bc == 0u) {
+                cc = a;
+            } else if (bc == 1u) {
+                cc = ad;
+            }
+            var av = vec3<i32>(0);
+            var bv = vec3<i32>(0);
+            var dv = vec3<i32>(0);
+            if (ba == 0u) {
+                av = cs;
+            } else if (ba == 1u) {
+                av = cd;
+            }
+            if (bb == 0u) {
+                bv = cs;
+            } else if (bb == 1u) {
+                bv = cd;
+            }
+            if (bd == 0u) {
+                dv = cs;
+            } else if (bd == 1u) {
+                dv = cd;
+            }
+            var o = (((av - bv) * cc) >> vec3<u32>(7u)) + dv;
+            if (colclamp) {
+                o = clamp(o, vec3<i32>(0), vec3<i32>(255));
+            } else {
+                o = o & vec3<i32>(0xFF);
+            }
+            r = o.x;
+            g = o.y;
+            b = o.z;
+        } else if (!colclamp) {
+            r = r & 0xFF;
+            g = g & 0xFF;
+            b = b & 0xFF;
+        }
+        if (has(s, F_DTHE)) {
+            // the GS's dither: DIMX row (y & 3), column (x & 3), a signed 3-bit value added to each channel before the 16-bit frame keeps 5 bits
+            let e = ((u32(y) & 3u) << 2u) | (u32(x) & 3u);
+            var bits = s.dimx0 >> (e * 4u);
+            if (e >= 8u) {
+                bits = s.dimx1 >> ((e - 8u) * 4u);
+            }
+            var d = i32(bits & 7u);
+            if (d >= 4) {
+                d = d - 8;
+            }
+            r = clamp(r + d, 0, 255);
+            g = clamp(g + d, 0, 255);
+            b = clamp(b + d, 0, 255);
+        }
+        var out_a = u32(a & 0xFF);
+        if (has(s, F_FBA)) {
+            out_a = out_a | 0x80u;
+        }
+        var mask = s.fbmsk;
+        if (!write_alpha) {
+            mask = mask | 0xFF000000u;
+        }
+        write_frame(s, fl, k, u32(r) | (u32(g) << 8u) | (u32(b) << 16u) | (out_a << 24u), mask);
+    }
+    if (write_z && zte) {
+        store(zl, k, z);
+        if (DEPTH_FRAC && s.zmax == 0xFFFFu) {
+            store_frac(zl, k, ((z & 0xFFu) << 8u) | depth_frac(at.z, s.zmax));
+        }
+    }
+}
+
+// DEPTH_FRAC: the fraction (8 bits) of the depth being drawn; none for a depth cut to the buffer's largest value.
+fn depth_frac(z: u32, zmax: u32) -> u32 {
+    if (z > zmax) {
+        return 0u;
+    }
+    return min(u32(g_zf * 256.0), 255u);
+}
+
+// DEPTH_FRAC: where the 16 bits beside a 16-bit depth are, after the emulated memory (4 MiB per sample) in the vram buffer.
+fn frac_word(l: Loc, k: u32) -> u32 {
+    return (1u << 20u) * SCALE * SCALE + l.word * SCALE * SCALE + k;
+}
+
+// DEPTH_FRAC: the fraction kept for the depth `old` now in the buffer, or 0 when what is kept belongs to another depth (written
+// some other way: an upload, a copy, a draw path that does not keep fractions).
+fn frac_at(l: Loc, k: u32, old: u32) -> u32 {
+    let e = (atomicLoad(&vram[frac_word(l, k)]) >> l.shift) & 0xFFFFu;
+    if ((e >> 8u) != (old & 0xFFu)) {
+        return 0u;
+    }
+    return e & 0xFFu;
+}
+
+fn store_frac(l: Loc, k: u32, value: u32) {
+    let w = frac_word(l, k);
+    let flip = (((atomicLoad(&vram[w]) >> l.shift) & 0xFFFFu) ^ value) & 0xFFFFu;
+    if (flip != 0u) {
+        atomicXor(&vram[w], flip << l.shift);
+    }
+}
+
+const PRIM_WORDS: u32 = 28u;
+const SETUP_WORDS: u32 = 42u;  // 40, then DIMX (gpu.cpp kSetupWords)
+const MIP_WORDS: u32 = 8u;
+
+fn fat(i: u32) -> f32 {
+    return bitcast<f32>(data[i]);
+}
+
+fn vertex_attr(p: u32, n: u32) -> vec4<f32> {
+    let c = data[p + 12u + n];
+    return vec4<f32>(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu), f32(c >> 24u));
+}
+
+fn vertex_tex(p: u32, n: u32) -> vec4<f32> {
+    return vec4<f32>(fat(p + 15u + n * 3u), fat(p + 16u + n * 3u), fat(p + 17u + n * 3u), f32((data[p + 11u] >> (n * 8u)) & 0xFFu));
+}
+
+fn z_at(p: u32, d: f32) -> u32 {
+    let z0 = data[p + 24u];
+    let step = floor(d);
+    g_zf = d - step;
+    if (step >= 0.0) {
+        return z0 + u32(min(step, f32(0xFFFFFFFFu - z0)));
+    }
+    return z0 - u32(min(-step, f32(z0)));
+}
+
+fn edge_in(w: f32, inclusive: u32) -> bool {
+    return w > 0.0 || (w == 0.0 && inclusive != 0u);
+}
+
+fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
+    rt_copy = false;
+    let kind = data[p + 1u];
+    // triangles only: a sprite can take its texture position from the console pixel's corner (point-sampled, a texel or more
+    // a pixel), the same for all of the pixel's samples, and must keep reading the screen sample (a picture drawn elsewhere and
+    // pasted in as a sprite, MC2's turning car on the car select, kept its finer samples that way)
+    g_sub_by_tex = kind == 0u;
+    var at: Attr;
+    g_tex_grad_on = false;
+    switch kind {
+        case 0u {
+            let x0 = fat(p + 4u);
+            let y0 = fat(p + 5u);
+            let x1 = fat(p + 6u);
+            let y1 = fat(p + 7u);
+            let x2 = fat(p + 8u);
+            let y2 = fat(p + 9u);
+            let inv = fat(p + 10u);
+            let s0 = cross2(x1 - px, y2 - py, x2 - px, y1 - py) * inv;
+            let s1 = cross2(x2 - px, y0 - py, x0 - px, y2 - py) * inv;
+            let c2 = cross2(x0 - px, y1 - py, x1 - px, y0 - py) * inv;
+            let inclusive = data[p + 27u];
+            // An edge that is exactly horizontal or vertical decides coverage at the console pixel's centre, as a sprite does
+            // below: 2D pieces laid side by side for the console's grid (Digital Devil Saga's solar-noise dial is two
+            // rectangles, x 27-56.5 and 57-86.5) leave a gap narrower than a pixel that covers no console pixel centre but
+            // does cover the finer samples of a scaled picture (a seam). Slanted edges keep the finer samples.
+            let cx = f32(x);
+            let cy = f32(y);
+            // Only for half of an upright rectangle (one horizontal and one vertical edge) at one depth, i.e. a 2D piece: its
+            // other half shares the slanted edge and tests it the same way. A triangle with a single straight edge next to other
+            // triangles' slanted edges would decide that line differently from its neighbours (specks along the dial's inner
+            // fan, drawn untextured), and small 3D triangles often have straight edges by chance on the 1/16-pixel grid (specks
+            // in hair). So: textured, one depth, one horizontal and one vertical edge.
+            let flat = y0 == y1 || y1 == y2 || y2 == y0;
+            let upright = x0 == x1 || x1 == x2 || x2 == x0;
+            let level = fat(p + 25u) == 0.0 && fat(p + 26u) == 0.0;
+            let rect = SCALE > 1u && flat && upright && level && has(s, F_TME);
+            let a0 = rect && (x1 == x2 || y1 == y2);
+            let a1 = rect && (x2 == x0 || y2 == y0);
+            let a2 = rect && (x0 == x1 || y0 == y1);
+            let ce0 = cross2(x1 - cx, y2 - cy, x2 - cx, y1 - cy) * inv;
+            let ce1 = cross2(x2 - cx, y0 - cy, x0 - cx, y2 - cy) * inv;
+            let ce2 = cross2(x0 - cx, y1 - cy, x1 - cx, y0 - cy) * inv;
+            let in0 = edge_in(select(s0, ce0, a0), inclusive & 1u);
+            let in1 = edge_in(select(s1, ce1, a1), inclusive & 2u);
+            let in2 = edge_in(select(c2, ce2, a2), inclusive & 4u);
+            if (!in0 || !in1 || !in2) {
+                return;
+            }
+            // A sample outside such an edge is covered only when its console pixel is, i.e. when the pixel's centre is inside
+            // the whole triangle (as on the console); the slanted edges alone would let a sliver whose straight edge passes a
+            // pixel centre spread into the rows beyond it (lines along the rain ripples). Such a sample takes its colour,
+            // texture coordinates and depth from the pixel's centre, as the console's pixel does, not from beyond the shape.
+            let out0 = a0 && !edge_in(s0, inclusive & 1u);
+            let out1 = a1 && !edge_in(s1, inclusive & 2u);
+            let out2 = a2 && !edge_in(c2, inclusive & 4u);
+            if ((out0 || out1 || out2) && !(edge_in(ce0, inclusive & 1u) && edge_in(ce1, inclusive & 2u) && edge_in(ce2, inclusive & 4u))) {
+                return;
+            }
+            let extended = out0 || out1 || out2;
+            let qx = select(px, cx, extended);
+            let qy = select(py, cy, extended);
+            let w0 = cross2(x1 - qx, y2 - qy, x2 - qx, y1 - qy) * inv;
+            let w1 = cross2(x2 - qx, y0 - qy, x0 - qx, y2 - qy) * inv;
+            let w2 = 1.0 - w0 - w1;
+            // Colour and fog as the first vertex's value plus weighted differences, like the depth: a value that is the same
+            // at all vertices (flat shading) comes out exactly instead of a hair below, which truncation would turn into one
+            // less (raster.cpp, lerp3).
+            let c0 = vertex_attr(p, 0u);
+            let c = bary4(c0, vertex_attr(p, 1u), vertex_attr(p, 2u), w1, w2);
+            let t0 = vertex_tex(p, 0u);
+            let t1 = vertex_tex(p, 1u);
+            let t2 = vertex_tex(p, 2u);
+            var t = weighted4(t0, t1, t2, w0, w1, w2);
+            t.w = bary1(t0.w, t1.w, t2.w, w1, w2);
+            if (TEX_SS && has(s, F_TME) && !(HAS_MIP && s.mip != 0u)) {
+                // the texture position one sample to the right and one below: the footprint sample_ss spreads its taps over
+                let h = 1.0 / f32(SCALE);
+                let qx = px + h;
+                let ax0 = cross2(x1 - qx, y2 - py, x2 - qx, y1 - py) * inv;
+                let ax1 = cross2(x2 - qx, y0 - py, x0 - qx, y2 - py) * inv;
+                let ty = py + h;
+                let ay0 = cross2(x1 - px, y2 - ty, x2 - px, y1 - ty) * inv;
+                let ay1 = cross2(x2 - px, y0 - ty, x0 - px, y2 - ty) * inv;
+                let uv = tex_uv(s, t);
+                let ux = tex_uv(s, weighted4(t0, t1, t2, ax0, ax1, 1.0 - ax0 - ax1)) - uv;
+                let uy = tex_uv(s, weighted4(t0, t1, t2, ay0, ay1, 1.0 - ay0 - ay1)) - uv;
+                g_tex_grad = vec4<f32>(ux.x, ux.y, uy.x, uy.y);
+                g_tex_grad_on = true;
+            }
+            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_at(p, sum2(fat(p + 25u), fat(p + 26u), w1, w2)));
+        }
+        case 1u {
+            let x0 = fat(p + 4u);
+            let y0 = fat(p + 5u);
+            let dx = fat(p + 6u);
+            let dy = fat(p + 7u);
+            let a = vertex_tex(p, 0u);
+            let b = vertex_tex(p, 1u);
+            var du = b.x - a.x;
+            var dv = b.y - a.y;
+            if (has(s, F_FST)) {
+                du = du / 16.0;
+                dv = dv / 16.0;
+            } else {
+                var q = b.z;
+                if (q == 0.0) {
+                    q = 1.0;
+                }
+                du = du / q * f32(1u << s.tw);
+                dv = dv / q * f32(1u << s.th);
+            }
+            var ux = px;
+            var uy = py;
+            let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
+            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct) && s.mip == 0u;
+            let near_x = abs(abs(du) - abs(dx)) <= abs(dx) * 0.05;
+            let near_y = abs(abs(dv) - abs(dy)) <= abs(dy) * 0.05;
+            let exact = abs(du) >= abs(dx) * 0.999 && abs(dv) >= abs(dy) * 0.999;
+            rt_copy = SCALE > 1u && has(s, F_TME) && direct && s.dec == 0xFFFFFFFFu && near_x && near_y && !exact;
+            if (point && abs(du) >= abs(dx) * 0.999) {
+                ux = f32(x);
+            }
+            if (point && abs(dv) >= abs(dy) * 0.999) {
+                uy = f32(y);
+            }
+            let cx = f32(x);
+            let cy = f32(y);
+            if (SCALE > 1u && (cx < min(x0, x0 + dx) || cx >= max(x0, x0 + dx) || cy < min(y0, y0 + dy) || cy >= max(y0, y0 + dy))) {
+                return;
+            }
+            var tx = 0.0;
+            var ty = 0.0;
+            if (dx != 0.0) {
+                tx = (ux - x0) / dx;
+            }
+            if (dy != 0.0) {
+                ty = (uy - y0) / dy;
+            }
+            let c = vertex_attr(p, 1u);
+            g_zf = 0.0;
+            at = Attr(c.x, c.y, c.z, c.w, lerp1(a.x, b.x, tx), lerp1(a.y, b.y, ty), b.z, b.w, data[p + 24u]);
+        }
+        case 2u {
+            let x0 = fat(p + 4u);
+            let y0 = fat(p + 5u);
+            let x1 = fat(p + 6u);
+            let y1 = fat(p + 7u);
+            let steps = i32(data[p + 8u]);
+            let count = max(steps, 1);
+            var guess = 0;
+            if (abs(x1 - x0) >= abs(y1 - y0)) {
+                if (x1 != x0) {
+                    guess = i32(round((px - x0) / (x1 - x0) * f32(steps)));
+                }
+            } else {
+                guess = i32(round((py - y0) / (y1 - y0) * f32(steps)));
+            }
+            var hit = -1;
+            for (var k = guess - 1; k <= guess + 1; k = k + 1) {
+                if (k < 0 || k >= count || hit >= 0) {
+                    continue;
+                }
+                var t = 0.0;
+                if (steps != 0) {
+                    t = f32(k) / f32(steps);
+                }
+                if (i32(round(x0 + (x1 - x0) * t)) == x && i32(round(y0 + (y1 - y0) * t)) == y) {
+                    hit = k;
+                }
+            }
+            if (hit < 0) {
+                return;
+            }
+            var t = 0.0;
+            if (steps != 0) {
+                t = f32(hit) / f32(steps);
+            }
+            let c0 = vertex_attr(p, 0u);
+            let c = lerp4(c0, vertex_attr(p, 1u), t);
+            let e0 = vertex_tex(p, 0u);
+            let e1 = vertex_tex(p, 1u);
+            var tex = weighted2(e0, e1, t);
+            tex.w = lerp1(e0.w, e1.w, t);
+            at = Attr(c.x, c.y, c.z, c.w, tex.x, tex.y, tex.z, tex.w, z_at(p, fat(p + 25u) * t));
+        }
+        default {
+            if (x != i32(data[p + 4u]) || y != i32(data[p + 5u])) {
+                return;
+            }
+            let c = vertex_attr(p, 0u);
+            let t = vertex_tex(p, 0u);
+            g_zf = 0.0;
+            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, data[p + 24u]);
+        }
+    }
+    plot(s, x, y, k, at);
+}
+
+@compute @workgroup_size(64)
+fn decode(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // all the decodes of a batch in one dispatch (gpu.cpp flush_batch): record n at prm(0) + n * 4 is setup, destination, words and
+    // the words of the records before it
+    let i = gid.x + gid.y * 64u * 1024u;
+    if (i >= prm(2u)) {
+        return;
+    }
+    let records = prm(0u);
+    var lo = 0u;
+    var hi = prm(1u);
+    while (hi - lo > 1u) {
+        let mid = (lo + hi) / 2u;
+        if (data[records + mid * 4u + 3u] <= i) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let r = records + lo * 4u;
+    let j = i - data[r + 3u];
+    let s = load_setup(data[r]);
+    let x = j & ((1u << s.tw) - 1u);
+    let y = j >> s.tw;
+    decoded[data[r + 1u] + j] = convert(s, load_at(addr(s.tf, x, y), 0u));
+}
+
+@compute @workgroup_size(64)
+fn snapshot(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * 64u * 1024u;
+    if (i >= prm(1u)) {
+        return;
+    }
+    scratch[i] = atomicLoad(&vram[prm(0u) * SCALE * SCALE + i]);
+}
+
+@compute @workgroup_size(64)
+fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = prm(0u) + gid.x + gid.y * 64u * 1024u;
+    if (i >= 1048576u) {
+        return;
+    }
+    scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
+}
+
+@compute @workgroup_size(TILE, TILE)
+fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let index = wid.x + wid.y * 1024u;
+    if (index >= prm(3u)) {
+        return;
+    }
+    let tile = prm(0u) + index * 2u;
+    let origin = data[tile];
+    let sx = (origin & 0xFFFFu) * TILE + lid.x;
+    let sy = (origin >> 16u) * TILE + lid.y;
+    let x = i32(sx / SCALE);
+    let y = i32(sy / SCALE);
+    let k = (sy % SCALE) * SCALE + sx % SCALE;
+    let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
+    let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
+    let first = data[tile + 1u];
+    let count = data[tile + 3u] - first;
+    let lists = prm(4u);
+    let prims = prm(1u);
+    let setups = prm(2u);
+    snapshot_lo = prm(5u);
+    snapshot_hi = prm(6u);
+    let mips = prm(9u);  // words 7 and 8 are not used here
+    var last_setup = 0xFFFFFFFFu;
+    var s: Setup;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let h = first + i;
+        let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
+        let si = data[p];
+        if (si != last_setup) {
+            s = load_setup(setups + si * SETUP_WORDS);
+            if (HAS_MIP && mips != 0xFFFFFFFFu) {
+                s.mip_at = mips + si * MIP_WORDS;
+                s.mip = data[s.mip_at];
+            }
+            last_setup = si;
+        }
+        let lo = data[p + 2u];
+        let hi = data[p + 3u];
+        if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
+            continue;
+        }
+        shade_at(p, s, x, y, k, px, py);
+    }
+}

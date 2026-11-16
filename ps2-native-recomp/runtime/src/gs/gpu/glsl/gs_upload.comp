@@ -1,0 +1,380 @@
+#version 430 core
+// glsl_compat.py: converted for nouveau and Ryujinx (see the script)
+#extension GL_ARB_compute_shader : require
+#extension GL_ARB_shader_storage_buffer_object : require
+
+// glsl_compat.py: uint division without nouveau's division routine (JCAL); exact for a, b < 2^31
+uint udiv_(uint a, uint b) {
+    float fb = float(b);
+    uint q = uint(float(a) / fb);
+    q = uint(int(q) + int(floor(float(int(a - q * b)) / fb)));
+    int r = int(a - q * b);
+    if (r < 0) q -= 1u;
+    else if (uint(r) >= b) q += 1u;
+    return q;
+}
+uint umod_(uint a, uint b) { return a - udiv_(a, b) * b; }
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct Params {
+    uvec4 v[16];
+};
+struct Loc {
+    uint word;
+    uint shift;
+    uint mask;
+};
+const uint PSMCT32_ = 0u;
+const uint PSMCT24_ = 1u;
+const uint PSMCT16_ = 2u;
+const uint PSMCT16S = 10u;
+const uint PSMT8_ = 19u;
+const uint PSMT4_ = 20u;
+const uint PSMT8H = 27u;
+const uint PSMT4HL = 36u;
+const uint PSMT4HH = 44u;
+const uint PSMZ32_ = 48u;
+const uint PSMZ24_ = 49u;
+const uint PSMZ16_ = 50u;
+const uint PSMZ16S = 58u;
+const uint T_OFF32_ = 0u;
+const uint T_OFFZ32_ = 2048u;
+const uint T_OFF16_ = 4096u;
+const uint T_OFF16S = 8192u;
+const uint T_OFFZ16_ = 12288u;
+const uint T_OFFZ16S = 16384u;
+const uint T_OFF8_ = 20480u;
+const uint T_OFF4_ = 28672u;
+const uint CLUT_ENTRIES = 512u;
+const uint F_IIP = 1u;
+const uint F_TME = 2u;
+const uint F_FGE = 4u;
+const uint F_ABE = 8u;
+const uint F_FST = 16u;
+const uint F_ZMSK = 32u;
+const uint F_ATE = 64u;
+const uint F_DATE = 128u;
+const uint F_DATM = 256u;
+const uint F_ZTE = 512u;
+const uint F_PABE = 1024u;
+const uint F_COLCLAMP = 2048u;
+const uint F_FBA = 4096u;
+const uint F_TCC = 8192u;
+const uint F_BILINEAR = 16384u;
+const uint F_AEM = 32768u;
+const uint F_DTHE = 65536u;
+const uint F_A_FROM_G = 131072u;
+const uint PRIM_WORDS = 28u;
+const uint SETUP_WORDS = 42u;
+const uint MIP_WORDS = 8u;
+const uint SCALE = 1u;
+
+layout(r32ui, binding = 0) uniform coherent uimageBuffer _group_0_binding_0_cs;
+
+layout(r32ui, binding = 1) uniform readonly uimageBuffer _group_0_binding_1_cs;
+
+layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
+
+layout(r32ui, binding = 3) uniform readonly uimageBuffer _group_0_binding_3_cs;
+
+layout(r32ui, binding = 6) uniform readonly uimageBuffer _group_0_binding_6_cs;
+
+
+uint prm(uint i) {
+    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
+    return _e9;
+}
+
+uint page_addr(uint bp, uint bw, uint x, uint y, uint pw, uint ph) {
+    uint per_row = max(1u, udiv_((bw * 64u), pw));
+    return ((bp * 256u) + ((udiv_(x, pw) + (udiv_(y, ph) * per_row)) * 8192u));
+}
+
+Loc locate(uint psm, uint bp_1, uint bw_1, uint x_1, uint y_1) {
+    uint a = 0u;
+    uint shift = 0u;
+    uint mask = 4294967295u;
+    { uint sw0_ = psm;if (sw0_ == 48u) {
+            uint _e13 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
+            uint _e25 = imageLoad(_group_0_binding_1_cs, int(((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e13 + _e25);
+} else if (sw0_ == 49u) {
+            uint _e29 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
+            uint _e41 = imageLoad(_group_0_binding_1_cs, int(((T_OFFZ32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e29 + _e41);
+            mask = 16777215u;
+} else if (sw0_ == 1u) {
+            uint _e46 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
+            uint _e58 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e46 + _e58);
+            mask = 16777215u;
+} else if (sw0_ == 2u) {
+            uint _e63 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
+            uint _e75 = imageLoad(_group_0_binding_1_cs, int(((T_OFF16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e63 + _e75);
+            uint _e77 = a;
+            shift = ((_e77 & 2u) * 8u);
+            mask = 65535u;
+} else if (sw0_ == 10u) {
+            uint _e85 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
+            uint _e97 = imageLoad(_group_0_binding_1_cs, int(((T_OFF16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e85 + _e97);
+            uint _e99 = a;
+            shift = ((_e99 & 2u) * 8u);
+            mask = 65535u;
+} else if (sw0_ == 50u) {
+            uint _e107 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
+            uint _e119 = imageLoad(_group_0_binding_1_cs, int(((T_OFFZ16_ + ((y_1 & 63u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e107 + _e119);
+            uint _e121 = a;
+            shift = ((_e121 & 2u) * 8u);
+            mask = 65535u;
+} else if (sw0_ == 58u) {
+            uint _e129 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 64u);
+            uint _e141 = imageLoad(_group_0_binding_1_cs, int(((T_OFFZ16S + ((y_1 & 63u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e129 + _e141);
+            uint _e143 = a;
+            shift = ((_e143 & 2u) * 8u);
+            mask = 65535u;
+} else if (sw0_ == 19u) {
+            uint _e151 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 64u);
+            uint _e163 = imageLoad(_group_0_binding_1_cs, int(((T_OFF8_ + ((y_1 & 63u) * 128u)) + (x_1 & 127u)))).x;
+            a = (_e151 + _e163);
+            uint _e165 = a;
+            shift = ((_e165 & 3u) * 8u);
+            mask = 255u;
+} else if (sw0_ == 20u) {
+            uint n = imageLoad(_group_0_binding_1_cs, int(((T_OFF4_ + ((y_1 & 127u) * 128u)) + (x_1 & 127u)))).x;
+            uint _e185 = page_addr(bp_1, bw_1, x_1, y_1, 128u, 128u);
+            a = (_e185 + (n / 2u));
+            uint _e189 = a;
+            shift = (((_e189 & 3u) * 8u) + ((n & 1u) * 4u));
+            mask = 15u;
+} else if (sw0_ == 27u) {
+            uint _e202 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
+            uint _e214 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e202 + _e214);
+            shift = 24u;
+            mask = 255u;
+} else if (sw0_ == 36u) {
+            uint _e220 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
+            uint _e232 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e220 + _e232);
+            shift = 24u;
+            mask = 15u;
+} else if (sw0_ == 44u) {
+            uint _e238 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
+            uint _e250 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e238 + _e250);
+            shift = 28u;
+            mask = 15u;
+} else {
+            uint _e256 = page_addr(bp_1, bw_1, x_1, y_1, 64u, 32u);
+            uint _e268 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_1 & 31u) * 64u)) + (x_1 & 63u)))).x;
+            a = (_e256 + _e268);
+} }
+    uint _e270 = a;
+    uint _e275 = shift;
+    uint _e276 = mask;
+    return Loc(((_e270 & 4194303u) >> 2u), _e275, _e276);
+}
+
+void store_diff(Loc l, uint k, uint old, uint value) {
+    uint flip = ((old ^ value) & l.mask);
+    if ((flip != 0u)) {
+        uint _e19 = imageAtomicXor(_group_0_binding_0_cs, int((((l.word * SCALE) * SCALE) + k)), (flip << l.shift));
+        return;
+    } else {
+        return;
+    }
+}
+
+void store(Loc l_1, uint k_1, uint value_1) {
+    uint w = (((l_1.word * SCALE) * SCALE) + k_1);
+    if ((l_1.mask == 4294967295u)) {
+        imageStore(_group_0_binding_0_cs, int(w), uvec4(value_1, 0u, 0u, 0u));
+        return;
+    }
+    uint _e16 = imageLoad(_group_0_binding_0_cs, int(w)).x;
+    store_diff(l_1, k_1, ((_e16 >> l_1.shift) & l_1.mask), value_1);
+    return;
+}
+
+void write_pixel(uint psm_1, uint bp_2, uint bw_2, uint x_2, uint y_2, uint value_2) {
+    uint k_2 = 0u;
+    Loc _e6 = locate(psm_1, bp_2, bw_2, x_2, y_2);
+    bool loop_init = true;
+    while(true) {
+        if (!loop_init) {
+            uint _e17 = k_2;
+            k_2 = (_e17 + 1u);
+        }
+        loop_init = false;
+        uint _e9 = k_2;
+        if ((_e9 < 1u)) {
+        } else {
+            break;
+        }
+        {
+            uint _e16 = k_2;
+            store(_e6, _e16, value_2);
+        }
+    }
+    return;
+}
+
+uint bits_at(uint offset, uint bit, uint count) {
+    uint v_1 = 0u;
+    uint w_1 = (offset + (bit / 32u));
+    uint s = (bit % 32u);
+    uint _e10 = imageLoad(_group_0_binding_3_cs, int(w_1)).x;
+    v_1 = (_e10 >> s);
+    if (((s + count) > 32u)) {
+        uint _e16 = v_1;
+        uint _e21 = imageLoad(_group_0_binding_3_cs, int((w_1 + 1u))).x;
+        v_1 = (_e16 | (_e21 << (32u - s)));
+    }
+    if ((count == 32u)) {
+        uint _e28 = v_1;
+        return _e28;
+    }
+    uint _e29 = v_1;
+    return (_e29 & ((1u << count) - 1u));
+}
+
+uint cache_bits_at(uint offset_1, uint bit_1, uint count_1) {
+    uint v_2 = 0u;
+    uint w_2 = (offset_1 + (bit_1 / 32u));
+    uint s_1 = (bit_1 % 32u);
+    uint _e10 = imageLoad(_group_0_binding_6_cs, int(w_2)).x;
+    v_2 = (_e10 >> s_1);
+    if (((s_1 + count_1) > 32u)) {
+        uint _e16 = v_2;
+        uint _e21 = imageLoad(_group_0_binding_6_cs, int((w_2 + 1u))).x;
+        v_2 = (_e16 | (_e21 << (32u - s_1)));
+    }
+    if ((count_1 == 32u)) {
+        uint _e28 = v_2;
+        return _e28;
+    }
+    uint _e29 = v_2;
+    return (_e29 & ((1u << count_1) - 1u));
+}
+
+void main_body_() {
+    uvec3 gid = gl_GlobalInvocationID;
+    uint lo = 0u;
+    uint hi = 0u;
+    uint v = 0u;
+    bool local = false;
+    bool local_1 = false;
+    bool local_2 = false;
+    bool local_3 = false;
+    uint g = (gid.x + ((gid.y * 64u) * 1024u));
+    uint i_1 = (g / 1u);
+    uint ks = (g % 1u);
+    uint _e21 = prm(2u);
+    if ((i_1 >= _e21)) {
+        return;
+    }
+    uint _e24 = prm(0u);
+    uint _e28 = prm(1u);
+    hi = _e28;
+    while(true) {
+        uint _e30 = hi;
+        uint _e31 = lo;
+        if (((_e30 - _e31) > 1u)) {
+        } else {
+            break;
+        }
+        {
+            uint _e35 = lo;
+            uint _e36 = hi;
+            uint mid = ((_e35 + _e36) / 2u);
+            uint _e47 = imageLoad(_group_0_binding_3_cs, int(((_e24 + (mid * 12u)) + 11u))).x;
+            if ((_e47 <= i_1)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+    }
+    uint _e49 = lo;
+    uint r = (_e24 + (_e49 * 12u));
+    uint _e57 = imageLoad(_group_0_binding_3_cs, int((r + 11u))).x;
+    uint k_3 = (i_1 - _e57);
+    uint rrw = imageLoad(_group_0_binding_3_cs, int((r + 5u))).x;
+    uint _e68 = imageLoad(_group_0_binding_3_cs, int((r + 6u))).x;
+    uint p = (_e68 + k_3);
+    uint _e74 = imageLoad(_group_0_binding_3_cs, int((r + 3u))).x;
+    uint x_3 = ((_e74 + umod_(p, rrw)) & 2047u);
+    uint _e83 = imageLoad(_group_0_binding_3_cs, int((r + 4u))).x;
+    uint y_3 = ((_e83 + udiv_(p, rrw)) & 2047u);
+    uint _e92 = imageLoad(_group_0_binding_3_cs, int((r + 10u))).x;
+    uint bpp = (_e92 & 255u);
+    uint _e101 = imageLoad(_group_0_binding_3_cs, int((r + 10u))).x;
+    if (((_e101 & 2147483648u) != 0u)) {
+        uint _e110 = imageLoad(_group_0_binding_3_cs, int((r + 8u))).x;
+        uint _e115 = imageLoad(_group_0_binding_3_cs, int((r + 9u))).x;
+        uint _e118 = cache_bits_at(_e110, (_e115 + (k_3 * bpp)), bpp);
+        v = _e118;
+    } else {
+        uint _e123 = imageLoad(_group_0_binding_3_cs, int((r + 8u))).x;
+        uint _e128 = imageLoad(_group_0_binding_3_cs, int((r + 9u))).x;
+        uint _e131 = bits_at(_e123, (_e128 + (k_3 * bpp)), bpp);
+        v = _e131;
+    }
+    uint psm_2 = imageLoad(_group_0_binding_3_cs, int((r + 2u))).x;
+    if (false) {
+        if (!((psm_2 == 48u))) {
+            local_1 = (psm_2 == 49u);
+        } else {
+            local_1 = true;
+        }
+        bool _e151 = local_1;
+        if (!(_e151)) {
+            local_2 = (psm_2 == 50u);
+        } else {
+            local_2 = true;
+        }
+        bool _e158 = local_2;
+        if (!(_e158)) {
+            local_3 = (psm_2 == 58u);
+        } else {
+            local_3 = true;
+        }
+        bool _e165 = local_3;
+        local = _e165;
+    } else {
+        local = false;
+    }
+    bool _e167 = local;
+    if (_e167) {
+        if ((ks != 0u)) {
+            return;
+        }
+        uint _e172 = imageLoad(_group_0_binding_3_cs, int(r)).x;
+        uint _e177 = imageLoad(_group_0_binding_3_cs, int((r + 1u))).x;
+        Loc _e178 = locate(psm_2, _e172, _e177, x_3, y_3);
+        uint _e186 = imageLoad(_group_0_binding_0_cs, int(((_e178.word * SCALE) * SCALE))).x;
+        uint _e191 = v;
+        if ((((_e186 >> _e178.shift) & _e178.mask) == (_e191 & _e178.mask))) {
+            return;
+        }
+        uint _e197 = imageLoad(_group_0_binding_3_cs, int(r)).x;
+        uint _e202 = imageLoad(_group_0_binding_3_cs, int((r + 1u))).x;
+        uint _e203 = v;
+        write_pixel(psm_2, _e197, _e202, x_3, y_3, _e203);
+        return;
+    }
+    uint _e206 = imageLoad(_group_0_binding_3_cs, int(r)).x;
+    uint _e211 = imageLoad(_group_0_binding_3_cs, int((r + 1u))).x;
+    Loc _e212 = locate(psm_2, _e206, _e211, x_3, y_3);
+    uint _e213 = v;
+    store(_e212, ks, _e213);
+    return;
+}
+
+
+void main() { main_body_(); }

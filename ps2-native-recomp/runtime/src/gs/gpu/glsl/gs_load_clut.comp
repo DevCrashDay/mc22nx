@@ -1,0 +1,271 @@
+#version 430 core
+// glsl_compat.py: converted for nouveau and Ryujinx (see the script)
+#extension GL_ARB_compute_shader : require
+#extension GL_ARB_shader_storage_buffer_object : require
+
+// glsl_compat.py: uint division without nouveau's division routine (JCAL); exact for a, b < 2^31
+uint udiv_(uint a, uint b) {
+    float fb = float(b);
+    uint q = uint(float(a) / fb);
+    q = uint(int(q) + int(floor(float(int(a - q * b)) / fb)));
+    int r = int(a - q * b);
+    if (r < 0) q -= 1u;
+    else if (uint(r) >= b) q += 1u;
+    return q;
+}
+uint umod_(uint a, uint b) { return a - udiv_(a, b) * b; }
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Params {
+    uvec4 v[16];
+};
+struct Loc {
+    uint word;
+    uint shift;
+    uint mask;
+};
+const uint PSMCT32_ = 0u;
+const uint PSMCT24_ = 1u;
+const uint PSMCT16_ = 2u;
+const uint PSMCT16S = 10u;
+const uint PSMT8_ = 19u;
+const uint PSMT4_ = 20u;
+const uint PSMT8H = 27u;
+const uint PSMT4HL = 36u;
+const uint PSMT4HH = 44u;
+const uint PSMZ32_ = 48u;
+const uint PSMZ24_ = 49u;
+const uint PSMZ16_ = 50u;
+const uint PSMZ16S = 58u;
+const uint T_OFF32_ = 0u;
+const uint T_OFFZ32_ = 2048u;
+const uint T_OFF16_ = 4096u;
+const uint T_OFF16S = 8192u;
+const uint T_OFFZ16_ = 12288u;
+const uint T_OFFZ16S = 16384u;
+const uint T_OFF8_ = 20480u;
+const uint T_OFF4_ = 28672u;
+const uint CLUT_ENTRIES = 512u;
+const uint F_IIP = 1u;
+const uint F_TME = 2u;
+const uint F_FGE = 4u;
+const uint F_ABE = 8u;
+const uint F_FST = 16u;
+const uint F_ZMSK = 32u;
+const uint F_ATE = 64u;
+const uint F_DATE = 128u;
+const uint F_DATM = 256u;
+const uint F_ZTE = 512u;
+const uint F_PABE = 1024u;
+const uint F_COLCLAMP = 2048u;
+const uint F_FBA = 4096u;
+const uint F_TCC = 8192u;
+const uint F_BILINEAR = 16384u;
+const uint F_AEM = 32768u;
+const uint F_DTHE = 65536u;
+const uint F_A_FROM_G = 131072u;
+const uint PRIM_WORDS = 28u;
+const uint SETUP_WORDS = 42u;
+const uint MIP_WORDS = 8u;
+const uint SCALE = 1u;
+
+layout(r32ui, binding = 0) uniform coherent uimageBuffer _group_0_binding_0_cs;
+
+layout(r32ui, binding = 1) uniform readonly uimageBuffer _group_0_binding_1_cs;
+
+layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
+
+layout(r32ui, binding = 3) uniform readonly uimageBuffer _group_0_binding_3_cs;
+
+layout(r32ui, binding = 4) uniform coherent uimageBuffer _group_0_binding_4_cs;
+
+
+uint prm(uint i) {
+    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
+    return _e9;
+}
+
+uint page_addr(uint bp, uint bw, uint x_1, uint y_1, uint pw, uint ph) {
+    uint per_row = max(1u, udiv_((bw * 64u), pw));
+    return ((bp * 256u) + ((udiv_(x_1, pw) + (udiv_(y_1, ph) * per_row)) * 8192u));
+}
+
+Loc locate(uint psm, uint bp_1, uint bw_1, uint x_2, uint y_2) {
+    uint a = 0u;
+    uint shift = 0u;
+    uint mask = 4294967295u;
+    { uint sw0_ = psm;if (sw0_ == 48u) {
+            uint _e13 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
+            uint _e25 = imageLoad(_group_0_binding_1_cs, int(((T_OFFZ32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e13 + _e25);
+} else if (sw0_ == 49u) {
+            uint _e29 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
+            uint _e41 = imageLoad(_group_0_binding_1_cs, int(((T_OFFZ32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e29 + _e41);
+            mask = 16777215u;
+} else if (sw0_ == 1u) {
+            uint _e46 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
+            uint _e58 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e46 + _e58);
+            mask = 16777215u;
+} else if (sw0_ == 2u) {
+            uint _e63 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 64u);
+            uint _e75 = imageLoad(_group_0_binding_1_cs, int(((T_OFF16_ + ((y_2 & 63u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e63 + _e75);
+            uint _e77 = a;
+            shift = ((_e77 & 2u) * 8u);
+            mask = 65535u;
+} else if (sw0_ == 10u) {
+            uint _e85 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 64u);
+            uint _e97 = imageLoad(_group_0_binding_1_cs, int(((T_OFF16S + ((y_2 & 63u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e85 + _e97);
+            uint _e99 = a;
+            shift = ((_e99 & 2u) * 8u);
+            mask = 65535u;
+} else if (sw0_ == 50u) {
+            uint _e107 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 64u);
+            uint _e119 = imageLoad(_group_0_binding_1_cs, int(((T_OFFZ16_ + ((y_2 & 63u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e107 + _e119);
+            uint _e121 = a;
+            shift = ((_e121 & 2u) * 8u);
+            mask = 65535u;
+} else if (sw0_ == 58u) {
+            uint _e129 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 64u);
+            uint _e141 = imageLoad(_group_0_binding_1_cs, int(((T_OFFZ16S + ((y_2 & 63u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e129 + _e141);
+            uint _e143 = a;
+            shift = ((_e143 & 2u) * 8u);
+            mask = 65535u;
+} else if (sw0_ == 19u) {
+            uint _e151 = page_addr(bp_1, bw_1, x_2, y_2, 128u, 64u);
+            uint _e163 = imageLoad(_group_0_binding_1_cs, int(((T_OFF8_ + ((y_2 & 63u) * 128u)) + (x_2 & 127u)))).x;
+            a = (_e151 + _e163);
+            uint _e165 = a;
+            shift = ((_e165 & 3u) * 8u);
+            mask = 255u;
+} else if (sw0_ == 20u) {
+            uint n_1 = imageLoad(_group_0_binding_1_cs, int(((T_OFF4_ + ((y_2 & 127u) * 128u)) + (x_2 & 127u)))).x;
+            uint _e185 = page_addr(bp_1, bw_1, x_2, y_2, 128u, 128u);
+            a = (_e185 + (n_1 / 2u));
+            uint _e189 = a;
+            shift = (((_e189 & 3u) * 8u) + ((n_1 & 1u) * 4u));
+            mask = 15u;
+} else if (sw0_ == 27u) {
+            uint _e202 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
+            uint _e214 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e202 + _e214);
+            shift = 24u;
+            mask = 255u;
+} else if (sw0_ == 36u) {
+            uint _e220 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
+            uint _e232 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e220 + _e232);
+            shift = 24u;
+            mask = 15u;
+} else if (sw0_ == 44u) {
+            uint _e238 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
+            uint _e250 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e238 + _e250);
+            shift = 28u;
+            mask = 15u;
+} else {
+            uint _e256 = page_addr(bp_1, bw_1, x_2, y_2, 64u, 32u);
+            uint _e268 = imageLoad(_group_0_binding_1_cs, int(((T_OFF32_ + ((y_2 & 31u) * 64u)) + (x_2 & 63u)))).x;
+            a = (_e256 + _e268);
+} }
+    uint _e270 = a;
+    uint _e275 = shift;
+    uint _e276 = mask;
+    return Loc(((_e270 & 4194303u) >> 2u), _e275, _e276);
+}
+
+uint read_sample(uint psm_1, uint bp_2, uint bw_2, uint x_3, uint y_3, uint k_1) {
+    Loc _e6 = locate(psm_1, bp_2, bw_2, x_3, y_3);
+    uint _e15 = imageLoad(_group_0_binding_0_cs, int((((_e6.word * SCALE) * SCALE) + k_1))).x;
+    return ((_e15 >> _e6.shift) & _e6.mask);
+}
+
+uint read_pixel(uint psm_2, uint bp_3, uint bw_3, uint x_4, uint y_4) {
+    uint _e6 = read_sample(psm_2, bp_3, bw_3, x_4, y_4, 0u);
+    return _e6;
+}
+
+void main_body_() {
+    uint k = gl_LocalInvocationIndex;
+    uint n = 0u;
+    uint entries = 0u;
+    uint x = 0u;
+    uint y = 0u;
+    uint slot = 0u;
+    uint _e2 = prm(1u);
+    bool loop_init = true;
+    while(true) {
+        if (!loop_init) {
+            uint _e142 = n;
+            n = (_e142 + 1u);
+        }
+        loop_init = false;
+        uint _e5 = n;
+        if ((_e5 < _e2)) {
+        } else {
+            break;
+        }
+        {
+            uint _e8 = prm(0u);
+            uint _e9 = n;
+            uint r = (_e8 + (_e9 * 12u));
+            uint _e15 = imageLoad(_group_0_binding_3_cs, int(r)).x;
+            uint src = (_e15 * CLUT_ENTRIES);
+            uint _e22 = imageLoad(_group_0_binding_3_cs, int((r + 1u))).x;
+            uint dst = (_e22 * CLUT_ENTRIES);
+            uint _e31 = imageLoad(_group_0_binding_4_cs, int((src + k))).x;
+            imageStore(_group_0_binding_4_cs, int((dst + k)), uvec4(_e31, 0u, 0u, 0u));
+            uint _e42 = imageLoad(_group_0_binding_4_cs, int(((src + k) + 256u))).x;
+            imageStore(_group_0_binding_4_cs, int(((dst + k) + 256u)), uvec4(_e42, 0u, 0u, 0u));
+            memoryBarrierImage();
+            barrier();
+            uint cbp = imageLoad(_group_0_binding_3_cs, int((r + 2u))).x;
+            uint cpsm = imageLoad(_group_0_binding_3_cs, int((r + 3u))).x;
+            uint csm = imageLoad(_group_0_binding_3_cs, int((r + 4u))).x;
+            uint csa = imageLoad(_group_0_binding_3_cs, int((r + 5u))).x;
+            uint _e67 = imageLoad(_group_0_binding_3_cs, int((r + 6u))).x;
+            bool eight = (_e67 != 0u);
+            entries = 16u;
+            if (eight) {
+                entries = 256u;
+            }
+            uint _e73 = entries;
+            if ((k < _e73)) {
+                if ((csm != 0u)) {
+                    uint _e89 = imageLoad(_group_0_binding_3_cs, int((r + 7u))).x;
+                    uint _e94 = imageLoad(_group_0_binding_3_cs, int((r + 8u))).x;
+                    uint _e102 = imageLoad(_group_0_binding_3_cs, int((r + 9u))).x;
+                    uint _e103 = read_pixel(cpsm, cbp, _e89, ((_e94 * 16u) + k), _e102);
+                    imageStore(_group_0_binding_4_cs, int((dst + (((csa * 16u) + k) & 511u))), uvec4(_e103, 0u, 0u, 0u));
+                } else {
+                    x = (k & 7u);
+                    y = (k >> 3u);
+                    slot = ((((csa & 15u) * 16u) + k) & 255u);
+                    if (eight) {
+                        uint j = (((k & 4294967271u) | ((k & 8u) << 1u)) | ((k & 16u) >> 1u));
+                        x = (j & 15u);
+                        y = (j >> 4u);
+                        slot = k;
+                    }
+                    uint _e135 = slot;
+                    uint _e139 = x;
+                    uint _e140 = y;
+                    uint _e141 = read_pixel(cpsm, cbp, 1u, _e139, _e140);
+                    imageStore(_group_0_binding_4_cs, int((dst + _e135)), uvec4(_e141, 0u, 0u, 0u));
+                }
+            }
+            memoryBarrierImage();
+            barrier();
+        }
+    }
+    return;
+}
+
+
+void main() { main_body_(); }

@@ -1,0 +1,6 @@
+# binary file -> C++ array: SRC, OUT, NAME (backend_deko3d.cpp's shaders)
+file(READ "${SRC}" hex HEX)
+string(LENGTH "${hex}" n)
+math(EXPR n "${n} / 2")
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
+file(WRITE "${OUT}" "extern const unsigned char ${NAME}[];\nextern const unsigned ${NAME}_size;\nalignas(256) const unsigned char ${NAME}[] = {${bytes}};\nconst unsigned ${NAME}_size = ${n};\n")

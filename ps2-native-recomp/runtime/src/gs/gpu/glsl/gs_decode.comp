@@ -1,0 +1,304 @@
+#version 430 core
+// glsl_compat.py: converted for nouveau and Ryujinx (see the script)
+#extension GL_ARB_compute_shader : require
+#extension GL_ARB_shader_storage_buffer_object : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct Params {
+    uvec4 v[16];
+};
+struct Loc {
+    uint word;
+    uint shift;
+    uint mask;
+};
+struct Fmt {
+    uint base;
+    uint per_row;
+    uint table;
+    uint bits;
+    uint mask;
+};
+struct Setup {
+    uint flags;
+    uint fbp;
+    uint fbw;
+    uint fpsm;
+    uint fbmsk;
+    uint zbp;
+    uint zpsm;
+    uint modes;
+    uint aref;
+    uint fix;
+    int scax0_;
+    int scax1_;
+    int scay0_;
+    int scay1_;
+    uint tbp;
+    uint tbw;
+    uint tpsm;
+    uint tw;
+    uint th;
+    uint cpsm;
+    uint csa;
+    uint minu;
+    uint maxu;
+    uint minv;
+    uint maxv;
+    uint ta0_;
+    uint ta1_;
+    uint fogcol;
+    uint clut;
+    uint zmax;
+    uint dec;
+    Fmt tf;
+    Fmt ff;
+    Fmt zf;
+    uint mip;
+    uint mip_at;
+    uint dimx0_;
+    uint dimx1_;
+};
+const uint PSMCT32_ = 0u;
+const uint PSMCT24_ = 1u;
+const uint PSMCT16_ = 2u;
+const uint PSMCT16S = 10u;
+const uint PSMT8_ = 19u;
+const uint PSMT4_ = 20u;
+const uint PSMT8H = 27u;
+const uint PSMT4HL = 36u;
+const uint PSMT4HH = 44u;
+const uint PSMZ32_ = 48u;
+const uint PSMZ24_ = 49u;
+const uint PSMZ16_ = 50u;
+const uint PSMZ16S = 58u;
+const uint T_OFF32_ = 0u;
+const uint T_OFFZ32_ = 2048u;
+const uint T_OFF16_ = 4096u;
+const uint T_OFF16S = 8192u;
+const uint T_OFFZ16_ = 12288u;
+const uint T_OFFZ16S = 16384u;
+const uint T_OFF8_ = 20480u;
+const uint T_OFF4_ = 28672u;
+const uint CLUT_ENTRIES = 512u;
+const uint F_IIP = 1u;
+const uint F_TME = 2u;
+const uint F_FGE = 4u;
+const uint F_ABE = 8u;
+const uint F_FST = 16u;
+const uint F_ZMSK = 32u;
+const uint F_ATE = 64u;
+const uint F_DATE = 128u;
+const uint F_DATM = 256u;
+const uint F_ZTE = 512u;
+const uint F_PABE = 1024u;
+const uint F_COLCLAMP = 2048u;
+const uint F_FBA = 4096u;
+const uint F_TCC = 8192u;
+const uint F_BILINEAR = 16384u;
+const uint F_AEM = 32768u;
+const uint F_DTHE = 65536u;
+const uint F_A_FROM_G = 131072u;
+const uint PRIM_WORDS = 28u;
+const uint SETUP_WORDS = 42u;
+const uint MIP_WORDS = 8u;
+const uint SCALE = 1u;
+
+layout(r32ui, binding = 0) uniform coherent uimageBuffer _group_0_binding_0_cs;
+
+layout(r32ui, binding = 1) uniform readonly uimageBuffer _group_0_binding_1_cs;
+
+layout(std140, binding = 2) uniform Params_block_2Compute { Params _group_0_binding_2_cs; };
+
+layout(r32ui, binding = 3) uniform readonly uimageBuffer _group_0_binding_3_cs;
+
+layout(r32ui, binding = 4) uniform coherent uimageBuffer _group_0_binding_4_cs;
+
+layout(r32ui, binding = 7) uniform coherent uimageBuffer _group_0_binding_7_cs;
+
+
+uint prm(uint i) {
+    uint _e9 = _group_0_binding_2_cs.v[(i / 4u)][(i % 4u)];
+    return _e9;
+}
+
+Fmt fmt_at(uint at) {
+    uint _e3 = imageLoad(_group_0_binding_3_cs, int(at)).x;
+    uint _e8 = imageLoad(_group_0_binding_3_cs, int((at + 1u))).x;
+    uint _e13 = imageLoad(_group_0_binding_3_cs, int((at + 2u))).x;
+    uint _e18 = imageLoad(_group_0_binding_3_cs, int((at + 3u))).x;
+    uint _e23 = imageLoad(_group_0_binding_3_cs, int((at + 4u))).x;
+    return Fmt(_e3, _e8, _e13, _e18, _e23);
+}
+
+Loc addr(Fmt f, uint x, uint y) {
+    uint pws = (f.bits & 15u);
+    uint phs = ((f.bits >> 4u) & 15u);
+    uint amask = ((f.bits >> 8u) & 3u);
+    uint nbit = ((f.bits >> 10u) & 1u);
+    uint n = imageLoad(_group_0_binding_1_cs, int(((f.table + ((y & ((1u << phs) - 1u)) << pws)) + (x & ((1u << pws) - 1u))))).x;
+    uint a_2 = ((f.base + (((x >> pws) + ((y >> phs) * f.per_row)) * 8192u)) + (n >> nbit));
+    return Loc(((a_2 & 4194303u) >> 2u), (((f.bits >> 11u) + ((a_2 & amask) * 8u)) + ((n & nbit) * 4u)), f.mask);
+}
+
+uint load_at(Loc l, uint k) {
+    uint _e10 = imageLoad(_group_0_binding_0_cs, int((((l.word * SCALE) * SCALE) + k))).x;
+    return ((_e10 >> l.shift) & l.mask);
+}
+
+Setup load_setup(uint at_1) {
+    Setup s = Setup(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0, 0, 0, 0, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, Fmt(0u, 0u, 0u, 0u, 0u), Fmt(0u, 0u, 0u, 0u, 0u), Fmt(0u, 0u, 0u, 0u, 0u), 0u, 0u, 0u, 0u);
+    uint _e5 = imageLoad(_group_0_binding_3_cs, int(at_1)).x;
+    s.flags = _e5;
+    uint _e11 = imageLoad(_group_0_binding_3_cs, int((at_1 + 1u))).x;
+    s.fbp = _e11;
+    uint _e17 = imageLoad(_group_0_binding_3_cs, int((at_1 + 2u))).x;
+    s.fbw = _e17;
+    uint _e23 = imageLoad(_group_0_binding_3_cs, int((at_1 + 3u))).x;
+    s.fpsm = _e23;
+    uint _e29 = imageLoad(_group_0_binding_3_cs, int((at_1 + 4u))).x;
+    s.fbmsk = _e29;
+    uint _e35 = imageLoad(_group_0_binding_3_cs, int((at_1 + 5u))).x;
+    s.zbp = _e35;
+    uint _e41 = imageLoad(_group_0_binding_3_cs, int((at_1 + 6u))).x;
+    s.zpsm = _e41;
+    uint _e47 = imageLoad(_group_0_binding_3_cs, int((at_1 + 7u))).x;
+    s.modes = _e47;
+    uint _e53 = imageLoad(_group_0_binding_3_cs, int((at_1 + 8u))).x;
+    s.aref = _e53;
+    uint _e59 = imageLoad(_group_0_binding_3_cs, int((at_1 + 9u))).x;
+    s.fix = _e59;
+    uint _e65 = imageLoad(_group_0_binding_3_cs, int((at_1 + 10u))).x;
+    s.scax0_ = int((_e65 & 65535u));
+    uint _e74 = imageLoad(_group_0_binding_3_cs, int((at_1 + 10u))).x;
+    s.scax1_ = int((_e74 >> 16u));
+    uint _e83 = imageLoad(_group_0_binding_3_cs, int((at_1 + 11u))).x;
+    s.scay0_ = int((_e83 & 65535u));
+    uint _e92 = imageLoad(_group_0_binding_3_cs, int((at_1 + 11u))).x;
+    s.scay1_ = int((_e92 >> 16u));
+    uint _e101 = imageLoad(_group_0_binding_3_cs, int((at_1 + 12u))).x;
+    s.tbp = _e101;
+    uint _e107 = imageLoad(_group_0_binding_3_cs, int((at_1 + 13u))).x;
+    s.tbw = _e107;
+    uint _e113 = imageLoad(_group_0_binding_3_cs, int((at_1 + 14u))).x;
+    s.tpsm = _e113;
+    uint _e119 = imageLoad(_group_0_binding_3_cs, int((at_1 + 15u))).x;
+    s.tw = (_e119 & 255u);
+    uint _e127 = imageLoad(_group_0_binding_3_cs, int((at_1 + 15u))).x;
+    s.th = (_e127 >> 8u);
+    uint _e135 = imageLoad(_group_0_binding_3_cs, int((at_1 + 16u))).x;
+    s.cpsm = _e135;
+    uint _e141 = imageLoad(_group_0_binding_3_cs, int((at_1 + 17u))).x;
+    s.csa = _e141;
+    uint _e147 = imageLoad(_group_0_binding_3_cs, int((at_1 + 18u))).x;
+    s.minu = (_e147 & 65535u);
+    uint _e155 = imageLoad(_group_0_binding_3_cs, int((at_1 + 18u))).x;
+    s.maxu = (_e155 >> 16u);
+    uint _e163 = imageLoad(_group_0_binding_3_cs, int((at_1 + 19u))).x;
+    s.minv = (_e163 & 65535u);
+    uint _e171 = imageLoad(_group_0_binding_3_cs, int((at_1 + 19u))).x;
+    s.maxv = (_e171 >> 16u);
+    uint _e179 = imageLoad(_group_0_binding_3_cs, int((at_1 + 20u))).x;
+    s.ta0_ = (_e179 & 255u);
+    uint _e187 = imageLoad(_group_0_binding_3_cs, int((at_1 + 20u))).x;
+    s.ta1_ = ((_e187 >> 8u) & 255u);
+    uint _e197 = imageLoad(_group_0_binding_3_cs, int((at_1 + 21u))).x;
+    s.fogcol = _e197;
+    uint _e203 = imageLoad(_group_0_binding_3_cs, int((at_1 + 22u))).x;
+    s.clut = _e203;
+    uint _e209 = imageLoad(_group_0_binding_3_cs, int((at_1 + 23u))).x;
+    s.zmax = _e209;
+    uint _e215 = imageLoad(_group_0_binding_3_cs, int((at_1 + 24u))).x;
+    s.dec = _e215;
+    Fmt _e219 = fmt_at((at_1 + 25u));
+    s.tf = _e219;
+    Fmt _e223 = fmt_at((at_1 + 30u));
+    s.ff = _e223;
+    Fmt _e227 = fmt_at((at_1 + 35u));
+    s.zf = _e227;
+    s.mip = 0u;
+    s.mip_at = 0u;
+    uint _e237 = imageLoad(_group_0_binding_3_cs, int((at_1 + 40u))).x;
+    s.dimx0_ = _e237;
+    uint _e243 = imageLoad(_group_0_binding_3_cs, int((at_1 + 41u))).x;
+    s.dimx1_ = _e243;
+    Setup _e244 = s;
+    return _e244;
+}
+
+bool has(Setup s_1, uint f_1) {
+    return ((s_1.flags & f_1) != 0u);
+}
+
+uint expand16_(uint c, uint flags, uint ta0, uint ta1) {
+    uint r = ((c & 31u) << 3u), g = (((c >> 5u) & 31u) << 3u), b = (((c >> 10u) & 31u) << 3u);
+    uint a = ((c & 32768u) != 0u) ? ta1 : (((flags & F_AEM) != 0u && (c & 32767u) == 0u) ? 0u : ta0);
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
+uint convert(uint tpsm, uint flags, uint ta0, uint ta1, uint clut, uint cpsm, uint csa, uint raw) {
+    uint res = raw;
+    if (tpsm == 1u || tpsm == 49u) {
+        uint a_1 = ((flags & F_AEM) != 0u && (raw & 16777215u) == 0u) ? 0u : ta0;
+        res = (raw & 16777215u) | (a_1 << 24u);
+    } else if (tpsm == 2u || tpsm == 10u || tpsm == 50u || tpsm == 58u) {
+        res = expand16_(raw, flags, ta0, ta1);
+    } else if (tpsm == 19u || tpsm == 27u) {
+        uint e = imageLoad(_group_0_binding_4_cs, int((clut * CLUT_ENTRIES) + (raw & 255u))).x;
+        res = (cpsm == PSMCT32_ || cpsm == PSMCT24_) ? e : expand16_(e, flags, ta0, ta1);
+    } else if (tpsm == 20u || tpsm == 36u || tpsm == 44u) {
+        uint e_1 = imageLoad(_group_0_binding_4_cs, int((clut * CLUT_ENTRIES) + ((((csa & 15u) * 16u) + (raw & 15u)) & 511u))).x;
+        res = (cpsm == PSMCT32_ || cpsm == PSMCT24_) ? e_1 : expand16_(e_1, flags, ta0, ta1);
+    }
+    return res;
+}
+
+void main_body_() {
+    uvec3 gid = gl_GlobalInvocationID;
+    uint lo = 0u;
+    uint hi = 0u;
+    uint i_1 = (gid.x + ((gid.y * 64u) * 1024u));
+    uint _e9 = prm(2u);
+    if ((i_1 >= _e9)) {
+        return;
+    }
+    uint _e12 = prm(0u);
+    uint _e16 = prm(1u);
+    hi = _e16;
+    while(true) {
+        uint _e18 = hi;
+        uint _e19 = lo;
+        if (((_e18 - _e19) > 1u)) {
+        } else {
+            break;
+        }
+        {
+            uint _e23 = lo;
+            uint _e24 = hi;
+            uint mid = ((_e23 + _e24) / 2u);
+            uint _e35 = imageLoad(_group_0_binding_3_cs, int(((_e12 + (mid * 4u)) + 3u))).x;
+            if ((_e35 <= i_1)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+    }
+    uint _e37 = lo;
+    uint r_1 = (_e12 + (_e37 * 4u));
+    uint _e45 = imageLoad(_group_0_binding_3_cs, int((r_1 + 3u))).x;
+    uint j = (i_1 - _e45);
+    uint _e49 = imageLoad(_group_0_binding_3_cs, int(r_1)).x;
+    Setup _e50 = load_setup(_e49);
+    uint x_1 = (j & ((1u << _e50.tw) - 1u));
+    uint y_1 = (j >> _e50.tw);
+    uint _e64 = imageLoad(_group_0_binding_3_cs, int((r_1 + 1u))).x;
+    Loc _e68 = addr(_e50.tf, x_1, y_1);
+    uint _e70 = load_at(_e68, 0u);
+    uint _e71 = convert(_e50.tpsm, _e50.flags, _e50.ta0_, _e50.ta1_, _e50.clut, _e50.cpsm, _e50.csa, _e70);
+    imageStore(_group_0_binding_7_cs, int((_e64 + j)), uvec4(_e71, 0u, 0u, 0u));
+    return;
+}
+
+
+void main() { main_body_(); }

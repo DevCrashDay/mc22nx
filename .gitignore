@@ -1,0 +1,17 @@
+# Nothing taken from the game goes into this repository: disc images, files extracted from them, recompiled game code,
+# recordings of its programs, save states, screenshots.
+*.iso
+*.bin
+*.elf
+*.ELF
+*.nro
+*.state
+*.ps2
+*.ppm
+*.png
+SLUS_*
+ps2-native-recomp/games/
+ps2-native-recomp/generated/
+ps2-native-recomp/build/
+ps2-native-recomp/isos/
+baseline/
